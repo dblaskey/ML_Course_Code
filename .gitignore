@@ -1,0 +1,8 @@
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Large dataset
+Data/water_quality_ml_dataset.json
