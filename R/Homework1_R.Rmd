@@ -1,0 +1,156 @@
+---
+title: "Homework 1"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r packages}
+library(tidyverse)
+library(lubridate)
+```
+
+## Warm up
+
+Given the vector below:
+
+```{r quiz-scores}
+quiz_scores <- c(78, 85, 92, 67, 88, 95, 73, 84)
+```
+
+Write R code to:
+
+1.  Print the first score.
+2.  Print the last score.
+3.  Calculate the average score.
+4.  Create a new vector containing only scores greater than or equal to 80.
+5.  Count how many students scored below 80.
+
+```{r warm-up-answers}
+
+```
+
+Write a function called `letter_grade()` that takes a numeric score and returns:
+
+| Score Range | Grade |
+|:------------|:------|
+| 90 or above | A     |
+| 80–89       | B     |
+| 70–79       | C     |
+| 60–69       | D     |
+| Below 60    | F     |
+
+Example:
+
+``` r
+letter_grade(92)
+```
+
+Expected output:
+
+``` r
+[1] "A"
+```
+
+```{r letter-grade-function}
+
+```
+
+Then:
+
+7.  Create a data frame using the `quiz_scores` vector.
+8.  Create a new column named `Letter_Grade` by applying the `letter_grade()` function.
+
+```{r quiz-data-frame}
+
+```
+
+Add the following vector as a column named `HoursOfStudy`:
+
+```{r study-hours}
+study_hours <- c("1", "1.5", "2.5", "0", "1", "1.5", "0.5", "1")
+```
+
+Once you create the column, do the following:
+
+9.  Change the column to numeric.
+10. Create a plot using `HoursOfStudy` and `quiz_scores`.
+11. Make the plot look polished and readable.
+
+```{r study-hours-plot}
+
+```
+
+## Data Analysis
+
+For this part, we will work with an actual dataset.
+
+Load the following dataset:
+
+<https://raw.githubusercontent.com/dblaskey/ML_Course_Code/main/Data/weatherHistory.csv>
+
+```{r load-weather-data}
+
+```
+
+It is usually best practice to keep a raw copy of the original data unless the dataset is exceptionally large. Create a copy of the dataset.
+
+```{r copy-weather-data}
+
+```
+
+Clean the column names of the data frame:
+
+1.  Remove spaces at the beginning and end of each column name.
+2.  Convert all column names to lowercase.
+3.  Replace any group of characters that is not a letter or number with an underscore.
+4.  Remove underscores from the beginning and end.
+
+```{r clean-column-names}
+
+```
+
+Now that you have cleaned the column names, it is time to understand and clean the dataset:
+
+1.  Notice there seems to be a typo in a column heading. Change `loud_cover` to `cloud_cover`.
+2.  Check for impossible data, such as precipitation, wind speed, visibility, cloud cover, or pressure below 0, and any variable outside reasonable earthly maximum and minimum values.
+3.  Give the count, mean, standard deviation, maximum, and minimum values for each numeric column.
+4.  Count the number of missing values in each column.
+5.  Create a new column that converts `formatted_date` to a date-time value.
+6.  Create new columns for hour, day, month, and year.
+
+```{r clean-weather-data}
+
+```
+
+Now create multiple plots to continue exploring the dataset:
+
+1.  Plot a time-series graph of wind speed.
+2.  Create a second time-series graph of air temperature and humidity using two different axes.
+3.  Plot daily average temperature by calendar date; for example, average all January 1 observations, all January 2 observations, and so on.
+4.  Make the plots polished and readable.
+
+```{r weather-plots}
+
+```
+
+## Rubric
+
+| Component             | Points |
+|:----------------------|-------:|
+| Warm up               |      5 |
+| Load and copy data    |      2 |
+| Clean column names    |      3 |
+| Clean dataset         |      6 |
+| Plots (3 points each) |      9 |
+| **Total**             | **25** |

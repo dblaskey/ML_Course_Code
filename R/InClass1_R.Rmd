@@ -1,0 +1,217 @@
+# Lecture 1 - In Class Activity
+
+**Goal:** Build a small, reproducible R project directory and Git repository.
+
+By the end of this document, you will have created a project folder with:
+
+``` text
+GEOL599_ML/
+├── data/
+│   └── raw/
+├── notebooks/
+├── outputs/
+├── scripts/
+├── .gitignore
+└── README.md
+```
+
+> **Important:** This document uses R code chunks. Terminal commands are run from R with `system2()`. For those in RStudio, make sure to switch from `Source` to `Visual` to see this markdown document how it is supposed to me loaded. Also, double check that `Knit on Save` is left unchecked.
+
+## Step 0: Check your setup
+
+Run the chunks below to confirm that R and Git are available.
+
+If Git is not installed, tell your instructor before continuing.
+
+```{r check-r}
+R.version.string
+```
+
+```{r check-git}
+git_version <- system2("git", "--version", stdout = TRUE, stderr = TRUE)
+cat(git_version, sep = "\n")
+```
+
+If you have an old version of R or do not have Git, please update or download it now.\
+Let Dylan know if you have any problems.
+
+## Step 1: Create a project directory
+
+We will create a new folder called `GEOL599_ML`.
+
+In a normal terminal, you would run:
+
+``` bash
+mkdir GEOL599_ML
+cd GEOL599_ML
+```
+
+Inside R Markdown, we can create the folder with R and set it as the root directory for the remaining code chunks.
+
+```{r create-project-directory}
+project_dir <- file.path(getwd(), "GEOL599_ML")
+dir.create(project_dir, showWarnings = FALSE, recursive = TRUE)
+normalizePath(project_dir)
+
+knitr::opts_knit$set(root.dir = project_dir)
+```
+
+## Step 2: Create a clean project structure
+
+A consistent folder structure makes projects easier to understand, rerun, share, and debug.
+
+We will create four main directories:
+
+- `data/raw/` for original input data
+- `notebooks/` for exploratory notebooks
+- `outputs/` for generated files, figures, and results
+- `scripts/` for reusable R scripts
+
+```{r create-folders}
+folders <- c("data/raw", "notebooks", "outputs", "scripts")
+
+for (folder in folders) {
+  dir.create(folder, recursive = TRUE, showWarnings = FALSE)
+}
+
+project_folders <- list.dirs(".", recursive = TRUE, full.names = TRUE)
+cat(sort(project_folders), sep = "\n")
+```
+
+### Checkpoint 1
+
+You should now have a folder structure that looks like this:
+
+``` text
+GEOL599_ML/
+├── data/
+│   └── raw/
+├── notebooks/
+├── outputs/
+└── scripts/
+```
+
+**Reflection prompt:** Why might it be risky to keep scripts, datasets, outputs, and notes all in one folder?
+
+## Step 3: Create a README file
+
+A `README.md` file explains what the project is, how to use it, and what someone needs to know to reproduce your work.
+
+```{r create-readme}
+readme_text <- c(
+  "# GEOL599 Applied Machine Learning for Geoscience Data",
+  "",
+  "This project includes all in-class assignments and homework from this course.",
+  "",
+  "## Project structure",
+  "",
+  "- `data/raw/`: original input data",
+  "- `notebooks/`: exploratory notebooks",
+  "- `outputs/`: generated results and figures",
+  "- `scripts/`: reusable R scripts"
+)
+
+writeLines(readme_text, "README.md")
+cat(readLines("README.md"), sep = "\n")
+```
+
+### Reflection prompt
+
+What information would someone need to understand or rerun your project six months from now?
+
+## Step 4: Initialize Git
+
+Git tracks changes to your files over time.
+
+First, initialize a Git repository.
+
+```{r git-init}
+cat(system2("git", "init", stdout = TRUE, stderr = TRUE), sep = "\n")
+```
+
+```{r git-status-initial}
+cat(system2("git", "status", stdout = TRUE, stderr = TRUE), sep = "\n")
+```
+
+## Step 5: Create a `.gitignore` file
+
+Not every file belongs in Git.
+
+For example, we usually do **not** commit:
+
+- R project environment files
+- R history and workspace files
+- R Markdown cache files
+- Generated outputs
+- System files such as `.DS_Store`
+
+```{r create-gitignore}
+gitignore_text <- c(
+  ".Rproj.user/",
+  ".Rhistory",
+  ".RData",
+  ".Ruserdata",
+  "*_cache/",
+  "*_files/",
+  "outputs/",
+  ".DS_Store"
+)
+
+writeLines(gitignore_text, ".gitignore")
+cat(readLines(".gitignore"), sep = "\n")
+```
+
+```{r git-status-after-ignore}
+cat(system2("git", "status", stdout = TRUE, stderr = TRUE), sep = "\n")
+```
+
+## Step 6: Make the first commit
+
+A commit is a snapshot of your project at a meaningful point in time.
+
+Before committing, Git may require your name and email. If Git asks for these, run the following commands in a terminal, replacing the values with your own:
+
+``` bash
+git config --global user.name "Your Name"
+git config --global user.email "your.email@example.com"
+```
+
+Now add the important project files and commit them.
+
+```{r git-add}
+cat(
+  system2("git", c("add", "README.md", ".gitignore"), stdout = TRUE, stderr = TRUE),
+  sep = "\n"
+)
+cat(system2("git", "status", stdout = TRUE, stderr = TRUE), sep = "\n")
+```
+
+```{r git-commit}
+commit_result <- system2(
+  "git",
+  c("commit", "-m", shQuote("Initial project setup")),
+  stdout = TRUE,
+  stderr = TRUE
+)
+cat(commit_result, sep = "\n")
+```
+
+```{r git-log}
+cat(system2("git", c("log", "--oneline"), stdout = TRUE, stderr = TRUE), sep = "\n")
+```
+
+## Optional: Connect to GitHub
+
+If you have a GitHub account and have created an empty repository online, you can connect this local repository to GitHub.
+
+In a terminal, run:
+
+``` bash
+git branch -M main
+git remote add origin <repository-url>
+git push -u origin main
+```
+
+Replace `<repository-url>` with your actual GitHub repository URL.
+
+This step is optional because account setup and authentication can take extra time. However, you should set this up before the next class.
