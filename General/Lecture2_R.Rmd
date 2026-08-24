@@ -1,0 +1,443 @@
+---
+title: "Lecture 2: Data Preparation and Missing Data in R"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+---
+
+# Lecture 2: Missing data and train/test splitting in R
+
+Filling missing data and train/test splitting are two fundamental preprocessing techniques. You divide your dataset into a training set used to fit the model and a test set used to evaluate performance on unseen data. Missing-data preprocessing should be learned from the training data whenever it is part of the modeling workflow.
+
+This version uses the **tidyverse** and **tidymodels**, two of the most common modern R ecosystems for data science and machine learning.
+
+```{r chunk-1}
+# Run once if needed:
+# install.packages(c("tidyverse", "tidymodels", "zoo", "jsonlite"))
+# install.packages("arrow")
+
+library(tidyverse)
+library(tidymodels)
+library(zoo)
+library(jsonlite)
+library(arrow)
+
+tidymodels_prefer()
+```
+
+## Handling missing data
+
+```{r chunk-2}
+df <- read_csv("https://raw.githubusercontent.com/dblaskey/ML_Course_Code/main/Data/missing_data_environmental_example.csv",
+               na = c("", "NA"), show_col_types = FALSE) %>%
+  mutate(Date = as.Date(Date))
+
+numeric_cols <- c(
+  "Year", "Month", "Air_Temp_degC", "Humidity_pct",
+  "Wind_Speed_m_s", "Precipitation_mm", "Cloud_Cover_pct",
+  "ENSO_Index", "Sea_Surface_Temp_degC"
+)
+
+# Coerce multiple columns to numeric. Values that cannot be converted become NA.
+df <- df %>%
+  mutate(across(all_of(numeric_cols), ~ suppressWarnings(as.numeric(.x))))
+```
+
+**Explore the dataset**
+
+Before deciding how to handle missing values, first understand the dataset.
+
+For example:
+- How many rows and columns are present?
+- Which columns contain missing values?
+- Are all numeric-looking columns actually numeric?
+- Why might R fail to recognize some of our missing values?
+- What missing values are there? Note that strings such as `"Unknown"` and sentinel values such as `99999.0` are not automatically treated as missing.
+
+```{r chunk-3}
+dim(df)
+glimpse(df)
+summary(df)
+
+# Number of NA values currently recognized in each column
+sort(colSums(is.na(df)), decreasing = TRUE)
+```
+
+**Standardize missing values**
+
+Convert the known missing-value codes to `NA`. In R, `NA` is the standard representation of a missing value.
+
+```{r chunk-4}
+missing_codes <- c("None", "Unknown", "NAN", "NaN", "99999.0", "99999.00")
+
+clean <- df %>%
+  mutate(
+    across(
+      everything(),
+      ~ {
+        x <- as.character(.x)
+        
+        x[x %in% c(
+          "None",
+          "Unknown",
+          "NAN",
+          "NaN",
+          "NA",
+          "99999",
+          "99999.0"
+        )] <- NA
+        
+        x
+      }
+    )
+  )
+
+clean <- clean %>%
+  mutate(
+    across(
+      all_of(numeric_cols),
+      as.numeric
+    )
+  )
+
+clean <- clean %>%
+  mutate(Date = as.Date(Date))
+
+missing_summary <- tibble(
+  Variable = names(clean),
+  Missing_n = colSums(is.na(clean)),
+  Missing_pct = round(colMeans(is.na(clean)) * 100, 1)
+) %>%
+  arrange(desc(Missing_pct))
+
+missing_summary
+```
+
+
+**Drop missing observations**
+
+The simplest option is to remove rows containing missing data. This can be reasonable when missingness is rare, but it can substantially reduce the sample size when many rows are affected.
+
+```{r chunk-5}
+dropped <- clean %>% drop_na()
+
+cat("Original rows:", nrow(clean), "\n")
+cat("Rows after drop_na():", nrow(dropped), "\n")
+cat("Rows removed:", nrow(clean) - nrow(dropped), "\n")
+
+```
+
+**Mean, median, and mode imputation**
+
+These methods replace missing observations with a summary statistic.
+
+- **Mean:** useful for approximately symmetric continuous variables.
+- **Median:** more resistant to outliers and skewed distributions.
+- **Mode:** useful for categorical variables.
+
+```{r chunk-6}
+demo <- clean %>%
+  mutate(Air_Temp_mean = replace_na(
+    Air_Temp_degC, mean(Air_Temp_degC, na.rm = TRUE)
+  ))
+
+demo %>%
+  filter(is.na(Air_Temp_degC)) %>%
+  select(Date, Air_Temp_degC, Air_Temp_mean) %>%
+  head(10)
+```
+
+**TODO**
+
+Do the same using the **median** for a numeric variable and the **mode** for a categorical variable.
+
+*Hint:* `median(x, na.rm = TRUE)` calculates the median. For categorical variables, `recipes::step_impute_mode()` is a convenient option in a modeling workflow.
+
+```{r chunk-7}
+# TODO
+```
+
+**Forward fill (`fill(..., .direction = "down")`)**
+
+Forward fill replaces a missing value with the **most recent previous observation**. This is common in time series, but it assumes the previous value remains a reasonable estimate.
+
+```{r chunk-8}
+ffill_demo <- clean %>%
+  arrange(Date) %>%
+  mutate(Air_Temp_original = Air_Temp_degC) %>%
+  fill(Air_Temp_degC, .direction = "down") %>%
+  rename(Air_Temp_ffill = Air_Temp_degC)
+
+ffill_demo %>%
+  filter(is.na(Air_Temp_original)) %>%
+  select(Date, Air_Temp_original, Air_Temp_ffill) %>%
+  head(10)
+```
+
+**Backward fill (`fill(..., .direction = "up")`)**
+
+Backward fill replaces a missing value with the **next available observation**.
+
+Be careful in forecasting applications: backward fill explicitly uses a future observation and can therefore create data leakage if used improperly.
+
+```{r chunk-9}
+bfill_demo <- clean %>%
+  arrange(Date) %>%
+  mutate(Air_Temp_original = Air_Temp_degC) %>%
+  fill(Air_Temp_degC, .direction = "up") %>%
+  rename(Air_Temp_bfill = Air_Temp_degC)
+
+bfill_demo %>%
+  filter(is.na(Air_Temp_original)) %>%
+  select(Date, Air_Temp_original, Air_Temp_bfill) %>%
+  head(10)
+```
+
+**Linear interpolation**
+
+Interpolation estimates missing values using neighboring observations. The `zoo` package provides `na.approx()`, which is commonly used for linear interpolation in R time series.
+
+```{r chunk-10}
+interp_demo <- clean %>%
+  arrange(Date) %>%
+  mutate(Air_Temp_interpolated = zoo::na.approx(
+    Air_Temp_degC, x = Date, na.rm = FALSE
+  ))
+
+interp_demo %>%
+  filter(is.na(Air_Temp_degC)) %>%
+  select(Date, Air_Temp_degC, Air_Temp_interpolated) %>%
+  head(10)
+```
+
+**Visual comparison**
+
+Compare observed air temperature with forward fill, backward fill, and interpolation.
+
+```{r chunk-11}
+comparison <- clean %>%
+  arrange(Date) %>%
+  mutate(
+    ffill = Air_Temp_degC,
+    bfill = Air_Temp_degC,
+    interpolate = zoo::na.approx(Air_Temp_degC, x = Date, na.rm = FALSE)
+  ) %>%
+  fill(ffill, .direction = "down") %>%
+  fill(bfill, .direction = "up") %>%
+  pivot_longer(c(Air_Temp_degC, ffill, bfill, interpolate),
+               names_to = "Method", values_to = "Temperature")
+
+ggplot(comparison, aes(Date, Temperature, color = Method)) +
+  geom_line() +
+  geom_point(size = 1) +
+  labs(x = "Date", y = "Air temperature (°C)", color = "Method") +
+  theme_minimal()
+```
+
+**Group-based imputation**
+
+Environmental data often have known structure. For monthly climate data, a missing July temperature may be better estimated from other Julys than from the overall annual median. Here we fill missing air temperatures using the median for the corresponding calendar month.
+
+```{r chunk-12}
+group_demo <- clean %>%
+  group_by(Month) %>%
+  mutate(Air_Temp_month_median = if_else(
+    is.na(Air_Temp_degC),
+    median(Air_Temp_degC, na.rm = TRUE),
+    Air_Temp_degC
+  )) %>%
+  ungroup()
+
+group_demo %>%
+  filter(is.na(Air_Temp_degC)) %>%
+  select(Date, Month, Air_Temp_degC, Air_Temp_month_median) %>%
+  head(10)
+```
+
+**Imputation with `recipes`**
+
+The `recipes` package is part of tidymodels and provides preprocessing steps that can be estimated using the training data and then applied to new data.
+
+```{r chunk-13}
+features <- c(
+  "Year", "Month", "Air_Temp_degC", "Humidity_pct",
+  "Wind_Speed_m_s", "Precipitation_mm",
+  "Cloud_Cover_pct", "ENSO_Index"
+)
+
+model_data <- clean %>%
+  drop_na(Sea_Surface_Temp_degC) %>%
+  arrange(Date)
+
+# Keep the final 20% of observations as the test set.
+data_split <- initial_time_split(model_data, prop = 0.80)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+median_recipe <- recipe(Sea_Surface_Temp_degC ~ ., data = train_data) %>%
+  update_role(Date, new_role = "ID") %>%
+  step_rm(Station) %>%
+  step_impute_median(all_numeric_predictors())
+
+# prep() learns imputation values from the TRAINING data only.
+median_prep <- prep(median_recipe, training = train_data)
+train_imputed <- bake(median_prep, new_data = train_data)
+test_imputed  <- bake(median_prep, new_data = test_data)
+
+cat("Missing predictor values in training data:",
+    sum(is.na(train_data[features])), "\n")
+cat("Missing predictor values after imputation:",
+    sum(is.na(train_imputed[features])), "\n")
+```
+
+## Train/test splitting
+
+For ordinary independent observations, `initial_split()` from **rsample/tidymodels** performs a random train/test split. The simplest use specifies the dataset and the proportion assigned to training.
+
+```{r chunk-14}
+set.seed(42)
+
+random_split <- initial_split(model_data, prop = 0.80)
+train_random <- training(random_split)
+test_random  <- testing(random_split)
+
+cat("Training samples:", nrow(train_random), "\n")
+cat("Test samples:", nrow(test_random), "\n")
+```
+
+This randomly assigns 80% of observations to training and 20% to testing.
+
+**TODO:** Change the code above so that **70%** of the observations are used for training and the remaining **30%** for testing.
+
+```{r chunk-15}
+# TODO
+```
+
+**Reproducibility**
+
+`set.seed()` makes a random split reproducible. Without setting the random seed, a different random split may be produced each time the code is run.
+
+```{r chunk-16}
+set.seed(4)
+split_1 <- initial_split(model_data, prop = 0.80)
+testing(split_1) %>% select(Sea_Surface_Temp_degC) %>% head(10)
+
+set.seed(4)
+split_2 <- initial_split(model_data, prop = 0.80)
+testing(split_2) %>% select(Sea_Surface_Temp_degC) %>% head(10)
+
+set.seed(5)
+split_3 <- initial_split(model_data, prop = 0.80)
+testing(split_3) %>% select(Sea_Surface_Temp_degC) %>% head(10)
+```
+
+For most machine-learning problems, random splitting is appropriate. For time series, however, random splitting destroys temporal order and can allow future observations to influence model development. Use `initial_time_split()` instead.
+
+```{r chunk-17}
+time_split <- initial_time_split(model_data, prop = 0.80)
+
+train_time <- training(time_split)
+test_time <- testing(time_split)
+
+cat("Training period:", as.character(min(train_time$Date)), "to",
+    as.character(max(train_time$Date)), "\n")
+cat("Testing period:", as.character(min(test_time$Date)), "to",
+    as.character(max(test_time$Date)), "\n")
+```
+
+**Time-series resampling**
+
+For repeated evaluation through time, tidymodels provides `rolling_origin()` in the **rsample** package. Like scikit-learn's `TimeSeriesSplit`, each assessment set occurs after its corresponding analysis/training set.
+
+Here we use an expanding training window (`cumulative = TRUE`) and assess the next 12 months.
+
+```{r chunk-18}
+# Example: start with 36 months of training data and test on the next 12 months.
+# skip = 11 moves ahead roughly one year between resamples.
+
+ts_folds <- rolling_origin(
+  model_data,
+  initial = 36,
+  assess = 12,
+  cumulative = TRUE,
+  skip = 11
+)
+
+ts_folds
+```
+
+```{r chunk-19}
+# Inspect the date ranges in each fold
+for (i in seq_len(nrow(ts_folds))) {
+  train_fold <- analysis(ts_folds$splits[[i]])
+  test_fold  <- assessment(ts_folds$splits[[i]])
+
+  cat("Fold", i, "\n")
+  cat("  Train:", as.character(min(train_fold$Date)), "to",
+      as.character(max(train_fold$Date)), "\n")
+  cat("  Test: ", as.character(min(test_fold$Date)), "to",
+      as.character(max(test_fold$Date)), "\n\n")
+}
+```
+
+**Stratified splitting for imbalanced data**
+
+For classification problems, `initial_split(..., strata = outcome)` can preserve the class distribution between training and test sets.
+
+```{r chunk-20}
+set.seed(34)
+
+imbalanced <- tibble(
+  x1 = rnorm(1000),
+  x2 = rnorm(1000),
+  class = factor(c(rep(0, 950), rep(1, 50)))
+)
+
+# Without stratification
+plain_split <- initial_split(imbalanced, prop = 0.80)
+prop.table(table(training(plain_split)$class))
+prop.table(table(testing(plain_split)$class))
+
+# With stratification
+set.seed(34)
+strat_split <- initial_split(imbalanced, prop = 0.80, strata = class)
+prop.table(table(training(strat_split)$class))
+prop.table(table(testing(strat_split)$class))
+```
+
+## Group Problem
+
+```{r chunk-21}
+# The group problem uses a JSON metadata file that points to a Parquet dataset.
+library(jsonlite)
+# library(arrow)  # Uncomment after installing arrow if needed.
+
+url <- "https://raw.githubusercontent.com/dblaskey/ML_Course_Code/main/Data/Climate.json"
+
+data <- fromJSON(url)
+data
+```
+
+```{r chunk-22}
+parquet_url <- data$data_set_description$parquet_url
+
+# Requires the arrow package:
+df <- arrow::read_parquet(parquet_url)
+df <- as_tibble(df)
+```
+
+We want to predict `Sea_Surface_Temp_degC` as a function of the other columns in the dataframe.
+
+**TODO:**
+1. Explore the dataset.
+2. Remove `Latitude`, `Longitude`, and `Altitude_m`.
+3. Change all `None`, `Unknown`, `NAN`, `NaN`, and `99999.0` values to `NA`.
+4. Fill all missing predictor values using the most appropriate method. Explain your choices.
+5. If the goal is to predict **future** sea-surface temperatures from new data, split the dataset into appropriate training and test sets.
+6. **Bonus:** Create rolling time-series resamples that could be used to compare models without allowing future observations into the training data.
+
+```{r chunk-23}
+# TODO
+```
