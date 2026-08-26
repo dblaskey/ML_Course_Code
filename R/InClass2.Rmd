@@ -1,0 +1,359 @@
+---
+title: "Week 2 - In Class Activity: End-to-end Machine Learning Pipeline in R"
+output: html_document
+---
+
+**Goal:** Create an end-to-end machine learning regression pipeline in R using `tidymodels`.
+
+In this activity, you will use an **abalone** dataset. The age of abalone is usually determined by cutting the shell through the cone, staining it, and counting the number of rings under a microscope. We will use easier-to-measure variables to predict the number of rings.
+
+By the end of the activity, you should be able to:
+
+1. Load and explore a dataset in R.
+2. Separate predictors from the response variable.
+3. Create new features from existing variables.
+4. Build a reusable preprocessing recipe.
+5. Fit and tune a machine learning model using cross-validation.
+6. Evaluate model performance on held-out test data.
+7. Interpret model behavior using predictions, residuals, and variable importance.
+8. Modify the pipeline to use a different model.
+
+**R machine learning library:** This R Markdown document uses `tidymodels`, the most common modern R ecosystem for machine learning workflows.
+
+**Dataset:** Warwick J Nash, Tracy L Sellers, Simon R Talbot, Andrew J Cawthorn and Wes B Ford (1994) "The Population Biology of Abalone (_Haliotis_ species) in Tasmania. I. Blacklip Abalone (_H. rubra_) from the North Coast and Islands of Bass Strait", Sea Fisheries Division, Technical Report No. 48 (ISSN 1034-3288).
+
+## 1. Setup
+
+This R Markdown document intentionally gives you some complete code and some incomplete code. Sections marked **TODO** are places where you should write or modify code yourself.
+
+If you do not already have these packages installed, run the install cell once. Then you can comment it out or skip it later.
+
+```{r chunk-1}
+# Run this once if the packages are not installed.
+# install.packages(c("tidymodels", "ranger", "kknn"))
+```
+
+```{r chunk-2}
+library(tidymodels)
+library(tidyverse)
+
+# Make results reproducible.
+set.seed(42)
+
+tidymodels_prefer()
+```
+
+## 2. Load the Data
+
+The dataset does not include column names in the raw CSV, so we add them manually while reading the file.
+
+```{r chunk-3}
+column_names <- c(
+  "sex", "length", "diameter", "height", "whole_weight",
+  "shucked_weight", "viscera_weight", "shell_weight", "rings"
+)
+
+abalone <- read_csv(
+  "https://raw.githubusercontent.com/dblaskey/ML_Course_Code/main/Data/abalone.csv",
+  col_names = column_names,
+  show_col_types = FALSE
+)
+
+abalone
+```
+
+## 3. Data Exploration
+
+Before fitting a model, we explore the dataset so we understand what each variable represents and what data types are present.
+
+```{r chunk-4}
+# Summary statistics for each variable.
+summary(abalone)
+```
+
+```{r chunk-5}
+# Determine the number of missing values in each column.
+abalone |>
+  summarize(across(everything(), ~ sum(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "missing_values") |>
+  arrange(desc(missing_values))
+```
+
+```{r chunk-6}
+# Determine the column types.
+glimpse(abalone)
+```
+
+```{r chunk-7}
+ggplot(abalone, aes(x = rings)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "gray75") +
+  labs(
+    x = "Number of Rings",
+    y = "Frequency",
+    title = "Histogram of Abalone Rings"
+  ) +
+  theme_minimal()
+```
+
+## 4. Model Preprocessing and Regression
+
+We now build a model for the number of abalone rings.
+
+The response variable is `rings`.
+
+The predictors are:
+
+| Name | Data Type | Units | Description |
+| --- | --- | --- | --- |
+| `sex` | nominal | | M, F, and I infant |
+| `length` | continuous | mm | Longest shell measurement |
+| `diameter` | continuous | mm | Perpendicular to length |
+| `height` | continuous | mm | With meat in shell |
+| `whole_weight` | continuous | grams | Whole abalone |
+| `shucked_weight` | continuous | grams | Weight of meat |
+| `viscera_weight` | continuous | grams | Gut weight after bleeding |
+| `shell_weight` | continuous | grams | After being dried |
+
+### Train/Test Split
+
+We split the data into training and testing sets. Because `rings` is numeric, we use `strata = rings` so the split tries to keep similar distributions of abalone ages in both sets.
+
+```{r chunk-8}
+set.seed(42)
+
+abalone_split <- initial_split(
+  abalone,
+  prop = 0.80,
+  strata = rings
+)
+
+abalone_train <- training(abalone_split)
+abalone_test  <- testing(abalone_split)
+
+abalone_train
+abalone_test
+```
+
+### Feature Engineering
+
+Feature engineering creates new predictors from existing predictors. We will talk more about this next week.
+
+In `tidymodels`, feature engineering usually belongs inside a `recipe`. This is important because the same transformations are applied consistently during training, cross-validation, and prediction.
+
+```{r chunk-9}
+abalone_recipe <- recipe(rings ~ ., data = abalone_train) |>
+  # Shape proxy
+  step_mutate(volume_proxy = length * diameter * height) |>
+  # Composition ratios. The small constant prevents division by zero.
+  step_mutate(shell_to_whole = shell_weight / (whole_weight + 1e-6)) |>
+  step_mutate(weight_per_size = whole_weight / (volume_proxy + 1e-6)) |>
+  # Residual-weight feature
+  step_mutate(nonmeat_weight = whole_weight - shucked_weight - viscera_weight) |>
+  # Preprocessing
+  step_impute_median(all_numeric_predictors()) |>
+  step_impute_mode(all_nominal_predictors()) |>
+  step_dummy(all_nominal_predictors(), one_hot = FALSE) |>
+  step_normalize(all_numeric_predictors())
+
+abalone_recipe
+```
+
+### Build the Random Forest Workflow
+
+We are using a **random forest** model, but do not worry too much about the details of this model or its hyperparameters yet. We will discuss random forests later in the semester. Right now, we are using it to demonstrate the end-to-end machine learning pipeline.
+
+The workflow combines:
+
+1. A preprocessing recipe.
+2. A model specification.
+3. A tuning grid.
+4. Cross-validation.
+
+```{r chunk-10}
+rf_model <- rand_forest(
+  trees = tune(),
+  mtry = tune(),
+  min_n = tune()
+) |>
+  set_engine("ranger", importance = "permutation") |>
+  set_mode("regression")
+
+rf_workflow <- workflow() |>
+  add_recipe(abalone_recipe) |>
+  add_model(rf_model)
+
+rf_workflow
+```
+
+### Cross-Validation
+
+Cross-validation gives a more realistic estimate of predictive performance than judging the model only on the training data. The training dataset is split into five folds. The model is trained on four folds and validated on the remaining fold, repeated five times.
+
+In this example, we tune the random forest using **RMSE**. Lower RMSE means better predictive performance.
+
+```{r chunk-11}
+set.seed(42)
+
+abalone_folds <- vfold_cv(
+  abalone_train,
+  v = 5,
+  strata = rings
+)
+
+rf_grid <- grid_regular(
+  trees(range = c(300, 500)),
+  mtry(range = c(2, 6)),
+  min_n(range = c(4, 8)),
+  levels = c(trees = 2, mtry = 3, min_n = 3)
+)
+
+rf_grid
+```
+
+```{r chunk-12}
+# WARNING: This cell may take a few minutes to run.
+
+set.seed(42)
+
+rf_tuned <- tune_grid(
+  rf_workflow,
+  resamples = abalone_folds,
+  grid = rf_grid,
+  metrics = metric_set(rmse, mae, rsq),
+  control = control_grid(save_pred = TRUE)
+)
+
+collect_metrics(rf_tuned) |>
+  arrange(mean)
+```
+
+```{r chunk-13}
+best_rf <- select_best(rf_tuned, metric = "rmse")
+best_rf
+
+final_rf_workflow <- finalize_workflow(rf_workflow, best_rf)
+
+final_rf_fit <- last_fit(
+  final_rf_workflow,
+  split = abalone_split,
+  metrics = metric_set(rmse, mae, rsq)
+)
+
+collect_metrics(final_rf_fit)
+```
+
+### Evaluate Predictions
+
+Now we collect predictions for the held-out test set and visualize how close the model predictions were to the observed number of rings.
+
+```{r chunk-14}
+rf_predictions <- collect_predictions(final_rf_fit) |>
+  mutate(residual = rings - .pred)
+
+rf_predictions |>
+  select(rings, .pred, residual) |>
+  head()
+```
+
+```{r chunk-15}
+rf_metrics <- collect_metrics(final_rf_fit)
+
+rmse_value <- rf_metrics |> filter(.metric == "rmse") |> pull(.estimate)
+mae_value  <- rf_metrics |> filter(.metric == "mae")  |> pull(.estimate)
+rsq_value  <- rf_metrics |> filter(.metric == "rsq")  |> pull(.estimate)
+
+ggplot(rf_predictions, aes(x = rings, y = .pred)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(linetype = "dashed") +
+  annotate(
+    "text",
+    x = min(rf_predictions$rings),
+    y = max(rf_predictions$.pred),
+    hjust = 0,
+    vjust = 1,
+    label = paste0(
+      "MAE = ", round(mae_value, 2),
+      "\nRMSE = ", round(rmse_value, 2),
+      "\nR-squared = ", round(rsq_value, 2)
+    )
+  ) +
+  labs(
+    x = "Actual Rings",
+    y = "Predicted Rings",
+    title = "Predicted vs. Actual Rings"
+  ) +
+  theme_minimal()
+```
+
+```{r chunk-16}
+ggplot(rf_predictions, aes(x = rings, y = residual)) +
+  geom_point(alpha = 0.55) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Actual Rings",
+    y = "Residual (actual - predicted)",
+    title = "Residuals: Positive Values Indicate Underprediction"
+  ) +
+  theme_minimal()
+```
+
+### Variable Importance
+
+Variable importance indicates which predictors provided the model with useful information during training. We will discuss this in more detail later in the semester.
+
+```{r chunk-17}
+final_rf_model <- extract_workflow(final_rf_fit) |>
+  extract_fit_parsnip()
+
+importance <- final_rf_model$fit$variable.importance |>
+  enframe(name = "feature", value = "importance") |>
+  arrange(desc(importance)) |>
+  slice_head(n = 15) |>
+  mutate(feature = reorder(feature, importance))
+
+ggplot(importance, aes(x = feature, y = importance)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = "Feature",
+    y = "Permutation importance",
+    title = "Random Forest Variable Importance"
+  ) +
+  theme_minimal()
+```
+
+## 5. Reflection Questions
+
+Answer these in a few sentences each.
+
+1. What are the required steps in this machine learning pipeline?
+2. What train/test split was used for this model?
+3. What does cross-validation do, and why do we use it?
+4. Which metric did we use to choose the best model?
+5. Did the model perform well? What evidence supports your answer?
+6. Look at the residual plot. Does the model make larger errors for younger or older abalone?
+7. Which predictors appear most important? Do those results make sense biologically?
+
+## 6. Change the Pipeline
+
+**TODO:** Update the pipeline to run a **K-nearest neighbors regression** model instead of a random forest.
+
+Use the same training/test split, recipe, cross-validation folds, and evaluation metrics.
+
+Hints:
+
+- The `tidymodels` model function is `nearest_neighbor()`.
+- Use `set_engine("kknn")`.
+- Use `set_mode("regression")`.
+- Tune at least `neighbors`.
+- You may also tune `weight_func` and `dist_power`.
+- You may need to install the `kknn` package with `install.packages("kknn")`.
+
+```{r chunk-18}
+# TODO: Build a KNN model specification.
+# TODO: Combine the existing abalone_recipe with your KNN model in a workflow.
+# TODO: Create a tuning grid for KNN.
+# TODO: Tune the KNN model with cross-validation.
+# TODO: Select the best KNN model, fit it to the training set, and evaluate it on the test set.
+```
+

@@ -1,0 +1,389 @@
+---
+title: "Homework 2: Your First Regression Model Pipeline in R"
+output: html_document
+---
+
+## Learning Goals
+
+By the end of this assignment, you will be able to:
+
+1. Frame a scientific prediction task as a supervised machine learning regression problem.
+2. Separate predictors from a numeric target variable.
+3. Split data into training and testing sets without leaking test information into model fitting.
+4. Build a reproducible preprocessing and modeling workflow using a `tidymodels` workflow.
+5. Evaluate a regression model using MAE, RMSE, and R².
+6. Interpret model performance and limitations in a scientific context.
+
+## Dataset
+
+We will use the **Palmer Penguins** dataset, which contains size measurements, clutch observations, and related field metadata for adult foraging Adelie, Chinstrap, and Gentoo penguins observed near Palmer Station in the Palmer Archipelago, Antarctica. The dataset was collected by Dr. Kristen Gorman and the Palmer Station Long Term Ecological Research Program.
+
+**Regression task:** predict penguin body mass in grams from anatomical measurements and field metadata.
+
+Dataset reference: Palmer Station LTER and Gorman (2020), Environmental Data Initiative.
+
+## Submission Instructions
+
+Submit a completed R Markdown document with:
+
+- All code chunks executed in order.
+- Written answers in the reflection prompts.
+- At least one model workflow that runs successfully.
+- One short interpretation of model performance in environmental or marine science terms.
+
+## 0. Setup
+
+Run the chunk below. If a package is missing, install it in your environment before continuing.
+
+```{r setup}
+# Run this once if the packages are not installed.
+# install.packages("tidymodels")
+```
+
+```{r libraries}
+library(tidymodels)
+library(tidyverse)
+
+set.seed(42)
+tidymodels_prefer()
+
+options(dplyr.width = Inf)
+
+regression_metrics <- metric_set(mae, rmse, rsq_trad)
+```
+
+## 1. Load the Data
+
+```{r load-data}
+data_url <- "https://raw.githubusercontent.com/allisonhorst/palmerpenguins/main/inst/extdata/penguins.csv"
+
+penguins <- read_csv(data_url, show_col_types = FALSE)
+
+penguins
+```
+
+### Exercise 1: Initial Inspection
+
+Use R to answer the following questions:
+
+1. How many rows and columns are in the dataset?
+2. Which columns are numeric? Which are categorical?
+3. How many missing values are present in each column?
+4. What is the range of the target variable, `body_mass_g`?
+
+```{r exercise-1-shape}
+# TODO: Inspect the dimensions of the dataframe.
+```
+
+```{r exercise-1-types-missing}
+# TODO: Inspect column names, data types, and missing values.
+```
+
+```{r exercise-1-target}
+# TODO: Summarize the target variable body_mass_g.
+```
+
+Write 2-4 sentences interpreting the dataset. Consider whether this is a large or small dataset and what kinds of scientific uncertainty or sampling limitations might matter.
+
+**Your answer:** TODO
+
+## 2. Define a Regression Problem
+
+Our target variable is `body_mass_g`, a continuous numeric measurement. We will predict it from a mix of numeric and categorical predictors.
+
+To avoid a circular prediction task, do **not** use `body_mass_g` as an input feature.
+
+```{r define-problem}
+target <- "body_mass_g"
+
+# We drop rows where the target is missing because supervised learning requires known labels.
+penguins_model <- penguins |>
+  filter(!is.na(body_mass_g))
+
+predictor_data <- penguins_model |>
+  select(-body_mass_g)
+
+target_data <- penguins_model |>
+  select(body_mass_g)
+
+dim(predictor_data)
+dim(target_data)
+
+predictor_data
+```
+
+### Exercise 2: Scientific Framing
+
+In 3-5 sentences, describe this prediction task in scientific language. For example:
+
+- What are we trying to estimate?
+- What kinds of measurements might be informative predictors?
+
+**Your answer:** TODO
+
+## 3. Split into Training and Test Sets
+
+The model will learn from the training set. The test set will be held aside until final evaluation.
+
+This split helps us estimate how well the model may perform on new observations that were not used during model fitting.
+
+```{r train-test-split}
+set.seed(42)
+
+penguin_split <- initial_split(
+  penguins_model,
+  prop = 0.80,
+  strata = body_mass_g
+)
+
+penguins_train <- training(penguin_split)
+penguins_test <- testing(penguin_split)
+
+dim(penguins_train)
+dim(penguins_test)
+```
+
+### Exercise 3: Why Split the Data?
+
+In 2-3 sentences, explain why evaluating on the same data used for training can give an overly optimistic estimate of model performance.
+
+**Your answer:** TODO
+
+## 4. Identify Numeric and Categorical Predictors
+
+A model workflow lets us apply different preprocessing steps to different column types.
+
+For this dataset:
+
+- Numeric columns can be imputed and scaled.
+- Categorical columns can be imputed and one-hot encoded.
+
+```{r predictor-types}
+# TODO: Double check that these make sense based on column data types you saw above.
+numeric_features <- penguins_train |>
+  select(-body_mass_g) |>
+  select(where(is.numeric)) |>
+  names()
+
+categorical_features <- penguins_train |>
+  select(-body_mass_g) |>
+  select(where(function(x) !is.numeric(x))) |>
+  names()
+
+numeric_features
+categorical_features
+```
+
+## 5. Build Preprocessing Steps
+
+The `recipe` below keeps preprocessing inside the model workflow. This is important because preprocessing should be learned from the training data only, then applied consistently to the test data. We will use median and mode for imputation for convienence, but we know that this is probably not the best imputation stratigy for this.
+
+```{r preprocessing-recipe}
+penguin_recipe <- recipe(body_mass_g ~ ., data = penguins_train) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_impute_mode(all_nominal_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+penguin_recipe
+```
+
+### Exercise 4: Explain the Preprocessing
+
+Briefly explain what each preprocessing step does:
+
+1. `step_impute_median()`
+2. `step_impute_mode()`
+3. `step_dummy()`
+4. `step_normalize()`
+
+**Your answer:** TODO
+
+## 6. Build and Train a Baseline Model
+
+Before training a real model, we need a simple baseline. Here, the baseline always predicts the mean body mass from the training data.
+
+A useful model should perform better than this simple benchmark.
+
+```{r baseline-model}
+baseline_mean <- mean(penguins_train$body_mass_g, na.rm = TRUE)
+
+baseline_predictions <- penguins_test |>
+  mutate(.pred = baseline_mean)
+
+baseline_metrics <- baseline_predictions |>
+  regression_metrics(truth = body_mass_g, estimate = .pred)
+
+baseline_metrics
+```
+
+## 7. Build and Train Your First Regression Workflow
+
+Now we combine preprocessing and a regression model into one workflow.
+
+This is the central pattern for many applied machine learning workflows:
+
+```text
+raw data -> preprocessing -> model -> predictions
+```
+
+```{r linear-workflow}
+linear_model <- linear_reg() |>
+  set_engine("lm")
+
+linear_workflow <- workflow() |>
+  add_recipe(penguin_recipe) |>
+  add_model(linear_model)
+
+linear_fit <- fit(linear_workflow, data = penguins_train)
+
+linear_fit
+```
+
+## 8. Evaluate the Model on the Test Set
+
+We will use three common regression metrics:
+
+- **MAE**: mean absolute error, in grams. Easy to interpret.
+- **RMSE**: root mean squared error, in grams. Penalizes larger errors more strongly.
+- **R²**: proportion of variance explained relative to a mean-prediction baseline.
+
+```{r test-set-evaluation}
+linear_predictions <- predict(linear_fit, new_data = penguins_test) |>
+  bind_cols(penguins_test)
+
+linear_metrics <- linear_predictions |>
+  regression_metrics(truth = body_mass_g, estimate = .pred)
+
+linear_metrics
+```
+
+### Exercise 5: Compare Against the Baseline
+
+In 3-5 sentences, compare the linear regression workflow to the baseline model. Address the following:
+
+1. Did the model improve over the baseline?
+2. Which metric is easiest for you to interpret scientifically?
+3. Is the error small or large relative to the observed range of body mass?
+
+**Your answer:** TODO
+
+## 9. Visualize Predictions and Residuals
+
+Plots help reveal model behavior that summary metrics can hide.
+
+```{r observed-vs-predicted}
+ggplot(linear_predictions, aes(x = body_mass_g, y = .pred)) +
+  geom_point(alpha = 0.8) +
+  geom_abline(linetype = "dashed") +
+  labs(
+    x = "Observed body mass (g)",
+    y = "Predicted body mass (g)",
+    title = "Observed vs. Predicted Penguin Body Mass"
+  ) +
+  theme_minimal()
+```
+
+```{r residual-plot}
+linear_predictions <- linear_predictions |>
+  mutate(residual = body_mass_g - .pred)
+
+ggplot(linear_predictions, aes(x = .pred, y = residual)) +
+  geom_point(alpha = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Predicted body mass (g)",
+    y = "Residual: observed - predicted (g)",
+    title = "Residual Plot"
+  ) +
+  theme_minimal()
+```
+
+### Exercise 6: Interpret the Plots
+
+In 4-6 sentences, describe what you see. Consider:
+
+- Are predictions close to the 1:1 line?
+- Are residuals centered around zero?
+- Are there outliers or patterns?
+- What might these patterns imply about model assumptions or missing predictors?
+
+**Your answer:** TODO
+
+## 10. Use Cross-Validation on the Training Set
+
+A single train/test split can be sensitive to which observations end up in each set. Cross-validation gives a more stable estimate of model performance by repeatedly fitting and evaluating the model on different training/validation folds.
+
+Important: cross-validation below is run only on the training data. The test set remains reserved for final evaluation.
+
+```{r cross-validation}
+set.seed(42)
+
+penguin_folds <- vfold_cv(
+  penguins_train,
+  v = 5,
+  strata = body_mass_g
+)
+
+cv_results <- fit_resamples(
+  linear_workflow,
+  resamples = penguin_folds,
+  metrics = regression_metrics,
+  control = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(cv_results)
+```
+
+```{r cross-validation-folds}
+collect_metrics(cv_results, summarize = FALSE)
+```
+
+### Exercise 7: Cross-Validation Interpretation
+
+In 2-4 sentences, compare the cross-validation results to the final test-set results. Are they broadly similar? What would it mean if they were very different?
+
+**Your answer:** TODO
+
+## 11. Modify the Feature Set
+
+Choose one of the following experiments:
+
+A. Remove categorical variables and use only anatomical measurements.  
+B. Remove `species` and test whether the model still performs well.  
+C. Use only field metadata such as `island`, `species`, `sex`, and `year`.  
+D. Add your own features, such as `bill_length_mm / flipper_length_mm`.  
+
+Record what you changed and whether performance improved, declined, or stayed similar.
+
+```{r modify-feature-set}
+# TODO: Modify the feature set and evaluate your experiment.
+```
+
+**Notes:** TODO
+
+## 12. Final Reflection
+
+Answer the following in a short paragraph or two:
+
+1. What is one advantage of using a workflow for applied scientific machine learning?
+2. What is one risk or limitation of this model?
+3. What additional data might improve predictions of penguin body mass?
+4. How could a similar workflow be used in geology, environmental science, or marine science?
+
+**Your final reflection:** TODO
+
+## Rubric
+
+| Component | Points |
+|---|---:|
+| Data loading and inspection completed | 1 |
+| Regression task clearly framed | 2 |
+| Train/test split and feature/target separation correct | 1 |
+| Preprocessing workflow implemented correctly | 3 |
+| Baseline and regression model evaluated with appropriate metrics | 3 |
+| Plots generated and interpreted | 3 |
+| Cross-validation completed and interpreted | 3 |
+| Modified feature set | 6 |
+| Final reflection connects ML workflow to Earth/environmental/marine science | 3 |
+| **Total** | **25** |
