@@ -108,8 +108,8 @@ The predictors are:
 | `sex` | nominal | | M, F, and I infant |
 | `length` | continuous | mm | Longest shell measurement |
 | `diameter` | continuous | mm | Perpendicular to length |
-| `height` | continuous | mm | With meat in shell |
-| `whole_weight` | continuous | grams | Whole abalone |
+| `height` | continuous | mm | Whole abalone |
+| `whole_weight` | continuous | grams | With meat in shell |
 | `shucked_weight` | continuous | grams | Weight of meat |
 | `viscera_weight` | continuous | grams | Gut weight after bleeding |
 | `shell_weight` | continuous | grams | After being dried |
