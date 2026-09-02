@@ -1,0 +1,537 @@
+---
+title: "Homework 3: Imbalanced Land-Cover Classification with Logistic Regression"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+## Scientific Context
+
+In this homework, you will work with the **Statlog Landsat Satellite** dataset. Each observation represents a 3 by 3 neighborhood of Landsat multispectral pixels, and the original class label describes the land-cover class of the center pixel.
+
+We will convert the original multiclass problem into an **imbalanced binary-classification** problem:
+
+> Can we identify the minority land-cover class, **damp grey soil**, from satellite spectral features?
+
+This is a useful geoscience and environmental-data problem because remote-sensing models are often used to map rare or spatially limited surface conditions. In those settings, ordinary accuracy can be misleading: a model may look accurate while failing to detect the class we care about.
+
+## Learning Objectives
+
+By completing this assignment, you will be able to:
+
+1. Load and inspect a public earth-observation dataset in R.
+2. Convert a multiclass land-cover problem into an imbalanced binary-classification problem.
+3. Quantify class imbalance and explain why accuracy can be misleading.
+4. Create stratified train, validation, and test sets.
+5. Build leakage-safe preprocessing and logistic-regression workflows with `tidymodels`.
+6. Compare a naive baseline, ordinary logistic regression, and upsampled logistic regression.
+7. Evaluate imbalanced classifiers using recall, precision, specificity, balanced accuracy, F-scores, ROC-AUC, and PR-AUC.
+8. Evaluate whether changing the probability threshold helps, using validation data only.
+
+## Submission
+
+Submit this completed R Markdown document knitted to PDF. Replace every **TODO** with your own code or written answer. Keep the test set untouched until the final evaluation section.
+
+## 0. Setup
+
+This homework uses the modern R machine-learning ecosystem:
+
+- `tidymodels` for splitting, preprocessing, modeling, prediction, and metrics.
+- `themis` for imbalance-aware recipe steps such as upsampling.
+- `readr` for loading the raw text files.
+- `dplyr`, loaded through `tidymodels`, for data handling.
+
+```{r setup, message=FALSE, warning=FALSE}
+# Install packages if needed:
+# install.packages(c("tidymodels", "themis", "readr"))
+
+library(tidymodels)
+library(themis)
+library(readr)
+
+theme_set(theme_minimal())
+
+set.seed(42)
+```
+
+## 1. Load the Dataset
+
+The dataset has 36 numeric predictors. These represent four spectral bands measured across a 3 by 3 pixel neighborhood.
+
+The original land-cover classes are:
+
+| Class | Land-Cover Label |
+|---:|---|
+| 1 | red soil |
+| 2 | cotton crop |
+| 3 | grey soil |
+| 4 | damp grey soil |
+| 5 | soil with vegetation stubble |
+| 7 | very damp grey soil |
+
+For this homework, class `4`, damp grey soil, is the positive class.
+
+```{r load-data}
+feature_names <- paste0("band_", 1:36)
+column_names <- c(feature_names, "land_cover")
+
+train_url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/statlog/satimage/sat.trn"
+test_url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/statlog/satimage/sat.tst"
+
+landsat_raw <- bind_rows(
+  read_table(train_url, col_names = column_names, show_col_types = FALSE),
+  read_table(test_url, col_names = column_names, show_col_types = FALSE)
+)
+
+landsat <- landsat_raw %>%
+  mutate(
+    damp_grey_soil = if_else(land_cover == 4, "damp_grey_soil", "other"),
+    damp_grey_soil = factor(damp_grey_soil, levels = c("damp_grey_soil", "other"))
+  ) %>%
+  select(-land_cover)
+
+landsat
+```
+
+### Question 1: Data Meaning and Prediction Target
+
+Answer in 1-3 sentences.
+
+- What is the model trying to predict?
+- Why is this a classification problem rather than a regression problem?
+
+**Answer:**  
+TODO
+
+## 2. Initial Data Checks
+
+Before modeling, inspect the dataset. Verify the number of rows and columns, check data types, look for missing values, and summarize the numeric predictors.
+
+```{r data-checks}
+# TODO: inspect the dataset shape, column names, data types, missing values, and numeric summaries.
+
+# Hints: dim, glimpse, colSums, is.na, summary
+```
+
+### Question 2: Predictor Variables
+
+- Are the predictors mostly numeric or categorical?
+
+**Answer:**  
+TODO
+
+## 3. Quantify Class Imbalance
+
+Calculate the number and percentage of observations in each class. Then calculate the majority-to-minority ratio.
+
+```{r class-imbalance}
+# calculate class counts and percentages.
+
+count(landsat, damp_grey_soil)
+count(landsat, damp_grey_soil) %>% mutate(percent = n / sum(n) * 100)
+```
+
+```{r imbalance-ratio}
+# calculate the majority-to-minority class ratio.
+class_counts <- count(landsat, damp_grey_soil)
+max(class_counts$n) / min(class_counts$n)
+```
+
+### Question 3: Why Accuracy Can Mislead
+
+Answer in 2-3 sentences.
+
+- If a model predicted the majority class for every row, why might its accuracy look acceptable?
+- What would that model's recall be for damp grey soil?
+- Why is recall important when mapping a rare class?
+
+**Answer:**  
+TODO
+
+## 4. Create Train, Validation, and Test Sets
+
+Use three disjoint subsets:
+
+- **Training set:** fit preprocessing parameters and model parameters.
+- **Validation set:** compare models and select a probability threshold.
+- **Test set:** estimate final performance once, after all modeling choices are locked.
+
+Use a 60% / 20% / 20% split. Because the positive class is uncommon, use stratification.
+
+```{r split-data}
+set.seed(42)
+
+# TODO: create train_data, validation_data, and test_data.
+# Use initial_split() twice and stratify by damp_grey_soil.
+
+# Hints:
+# dev_test_split <- initial_split(...)
+# dev_data <- training(...)
+# test_data <- testing(...)
+# train_val_split <- initial_split(...)
+```
+
+```{r split-summary}
+# A split summary showing rows, positive count, and positive fraction
+# for train, validation, and test.
+
+split_summary <- bind_rows(
+  train_data %>%
+    summarize(
+      split = "train",
+      rows = n(),
+      positive_count = sum(damp_grey_soil == "damp_grey_soil"),
+      positive_fraction = mean(damp_grey_soil == "damp_grey_soil")
+    ),
+  validation_data %>%
+    summarize(
+      split = "validation",
+      rows = n(),
+      positive_count = sum(damp_grey_soil == "damp_grey_soil"),
+      positive_fraction = mean(damp_grey_soil == "damp_grey_soil")
+    ),
+  test_data %>%
+    summarize(
+      split = "test",
+      rows = n(),
+      positive_count = sum(damp_grey_soil == "damp_grey_soil"),
+      positive_fraction = mean(damp_grey_soil == "damp_grey_soil")
+    )
+)
+
+split_summary
+```
+
+### Question 4: Splitting and Leakage
+
+Answer each prompt in 2-4 sentences.
+
+1. Why is stratification useful in this dataset?
+2. What is the validation set used for?
+3. Why should the test set not be used to choose a model or threshold?
+4. Explain how fitting scaling, imputation, or upsampling before splitting can leak information.
+
+**Answers:**
+
+1. TODO
+2. TODO
+3. TODO
+4. TODO
+
+## 5. Build Logistic-Regression Workflows
+
+We will compare three workflows:
+
+1. A majority-class baseline model.
+2. Ordinary logistic regression.
+3. Logistic regression with upsampling applied inside the recipe.
+
+Upsampling increases the number of minority-class examples in the training data by resampling them. It must occur inside the modeling workflow so that it is applied only to training data.
+
+```{r recipes}
+# Create a basic recipe for logistic regression.
+
+logistic_recipe <- recipe(damp_grey_soil ~ ., data = train_data) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+upsample_recipe <- logistic_recipe %>%
+  step_upsample(damp_grey_soil, over_ratio = 1)
+```
+
+```{r model-specs}
+# Create a null model specification and a logistic regression specification.
+
+null_spec <- null_model() %>%
+   set_engine("parsnip") %>%
+   set_mode("classification")
+
+logistic_spec <- logistic_reg() %>%
+   set_engine("glm") %>%
+   set_mode("classification")
+```
+
+```{r workflows}
+# TODO: create three workflows named:
+# baseline_workflow
+# logistic_workflow
+# upsampled_logistic_workflow
+
+# Hint: use workflow(), add_recipe(), and add_model().
+```
+
+```{r fit-models}
+# TODO: fit all three workflows on train_data.
+
+# Hints:
+# baseline_fit <- fit(...)
+# etc
+# etc
+```
+
+### Question 5: Model Choice
+
+Answer in 1-3 sentences.
+
+- Why include a majority-class baseline?
+- Why is logistic regression a reasonable first classification model?
+- What does upsampling change?
+- Why must upsampling happen inside the training workflow?
+
+**Answer:**  
+TODO
+
+## 6. Evaluate Models on the Validation Set
+
+For an imbalanced classification problem, no single metric is sufficient.
+
+Important metrics:
+
+- **Recall / sensitivity:** fraction of damp-grey-soil pixels detected.
+- **Precision:** fraction of predicted damp-grey-soil pixels that were actually damp grey soil.
+- **Specificity:** fraction of other land-cover pixels correctly identified.
+- **Balanced accuracy:** mean of sensitivity and specificity.
+- **F1:** balances precision and recall equally.
+- **F2:** gives recall more weight than precision.
+- **ROC-AUC:** ranking performance across thresholds.
+- **PR-AUC:** precision-recall area; often useful for imbalanced data.
+
+```{r helper-functions}
+positive_level <- "damp_grey_soil"
+prob_col <- ".pred_damp_grey_soil"
+
+predict_with_threshold <- function(fit, new_data, threshold = 0.5) {
+  # TODO: return a data frame with truth, predicted probabilities, and thresholded classes.
+
+  # Hints:
+  # predict(...) #Only need to update this line!!
+  # bind_cols(new_data %>% select(damp_grey_soil))
+  # mutate(.pred_class = if_else(.pred_damp_grey_soil >= threshold, "damp_grey_soil", "other"))
+  # mutate(.pred_class = factor(.pred_class, levels = levels(damp_grey_soil)))
+}
+
+calculate_metrics <- function(predictions) {
+  tibble(
+    accuracy = accuracy_vec(
+      predictions$damp_grey_soil,
+      predictions$.pred_class
+    ),
+    recall = sens_vec(
+      predictions$damp_grey_soil,
+      predictions$.pred_class,
+      event_level = "first"
+    ),
+    precision = precision_vec(
+      predictions$damp_grey_soil,
+      predictions$.pred_class,
+      event_level = "first"
+    ),
+    specificity = spec_vec(
+      predictions$damp_grey_soil,
+      predictions$.pred_class,
+      event_level = "first"
+    ),
+    balanced_accuracy = bal_accuracy_vec(
+      predictions$damp_grey_soil,
+      predictions$.pred_class,
+      event_level = "first"
+    ),
+    f1 = f_meas_vec(
+      predictions$damp_grey_soil,
+      predictions$.pred_class,
+      event_level = "first"
+    ),
+    f2 = f_meas_vec(
+      predictions$damp_grey_soil,
+      predictions$.pred_class,
+      beta = 2,
+      event_level = "first"
+    ),
+    roc_auc = roc_auc_vec(
+      predictions$damp_grey_soil,
+      predictions$.pred_damp_grey_soil,
+      event_level = "first"
+    ),
+    pr_auc = pr_auc_vec(
+      predictions$damp_grey_soil,
+      predictions$.pred_damp_grey_soil,
+      event_level = "first"
+    )
+  )
+}
+```
+
+```{r validation-metrics}
+# TODO: calculate validation metrics for all three models at threshold 0.5.
+
+# Hints:
+# baseline_val <- predict_with_threshold(...)
+# logistic_val <- predict_with_threshold(...)
+# upsampled_val <- predict_with_threshold(...)
+#
+bind_rows(
+   calculate_metrics(baseline_val) %>% mutate(model = "Baseline"),
+   calculate_metrics(logistic_val) %>% mutate(model = "Logistic regression"),
+   calculate_metrics(upsampled_val) %>% mutate(model = "Upsampled logistic regression")
+)
+```
+
+```{r validation-confusion}
+# TODO: create confusion matrices for the two logistic-regression models.
+
+# Hint:
+# conf_mat(...)
+```
+
+### Question 6: Validation Comparison
+
+Using the validation results, answer in complete sentences.
+
+1. Why can the baseline model have high accuracy but zero usefulness for the positive class?
+2. Compare ordinary logistic regression and upsampled logistic regression at threshold 0.5.
+3. Which model has better recall for damp grey soil?
+4. What happened to precision and specificity?
+
+**Answers:**
+
+1. TODO
+2. TODO
+3. TODO
+4. TODO
+
+## 7. Examine ROC and Precision-Recall Curves
+
+Curves show model behavior across possible thresholds. For imbalanced classification, the precision-recall curve is often more informative than the ROC curve because it focuses directly on positive-class detection.
+
+```{r roc-curve}
+# plot ROC curves for ordinary and upsampled logistic regression.
+
+bind_rows(
+   logistic_val %>% mutate(model = "Logistic regression"),
+   upsampled_val %>% mutate(model = "Upsampled logistic regression")
+) %>%
+   roc_curve(truth = damp_grey_soil, .pred_damp_grey_soil, event_level = "first") %>%
+   autoplot()
+```
+
+```{r pr-curve}
+# TODO: plot precision-recall curves for ordinary and upsampled logistic regression.
+
+# Hint: use pr_curve() and autoplot().
+```
+
+### Question 7: Curve Interpretation
+
+Answer in 3-6 sentences.
+
+- Why is the precision-recall baseline equal to the positive-class prevalence?
+- Can two models have similar ROC-AUC but different rare-class precision? Why?
+- Which curve is more useful for thinking about missed rare land-cover areas versus false alarms?
+
+**Answer:**  
+TODO
+
+## 8. Test Probability Thresholds Using Validation Data
+
+The default threshold of 0.5 is not automatically best for an imbalanced problem, but changing the threshold does not improve the model itself. It only changes the tradeoff between the types of errors the model makes.
+
+For this exercise, test a range of thresholds for the **upsampled logistic regression** model and identify the threshold that maximizes **F2** on the validation set. Then compare that threshold with 0.5. If the F2-selected threshold creates too many false positives, lowers balanced accuracy, or makes the model less useful for the stated mapping goal, it is reasonable to conclude that threshold adjustment did not help.
+
+The important lesson is not that threshold tuning always improves performance. The lesson is that thresholds encode a decision policy: they decide whether the model should miss more positive cases or produce more false alarms.
+
+```{r threshold-search}
+# Search thresholds from 0.01 to 0.99 and identify the threshold with the best F2.
+
+threshold_grid <- tibble(threshold = seq(0.01, 0.99, by = 0.01))
+threshold_results <- threshold_grid %>%
+   mutate(predictions = map(threshold, ~ predict_with_threshold(upsampled_logistic_fit, validation_data, threshold = .x))) %>%
+   mutate(metrics = map(predictions, calculate_metrics)) %>%
+   select(-predictions) %>%
+   unnest(metrics)
+
+best_threshold <- threshold_results %>%
+   slice_max(f2, n = 1, with_ties = FALSE) %>%
+   pull(threshold)
+```
+
+```{r threshold-plot}
+# TODO: plot precision, recall, and F2 across thresholds.
+
+# Hint: pivot precision, recall, and f2 into long format, then use ggplot().
+```
+
+### Question 8: Threshold Choice
+
+Answer in complete sentences.
+
+1. Is your selected threshold above or below 0.5?
+2. What happens to false positives and false negatives when the threshold is lowered?
+3. Did the F2-selected threshold make the model more useful than the 0.5 threshold? Explain using at least two metrics or confusion-matrix counts.
+4. Is maximizing F2 automatically the correct policy? What field, cost, or scientific information would you need before choosing a real operational threshold?
+
+**Answers:**
+
+1. TODO
+2. TODO
+3. TODO
+4. TODO
+
+## 9. Final Evaluation on the Untouched Test Set
+
+At this point, the model and threshold have been selected using validation data. If the F2-selected threshold made validation performance worse for the assignment goal, you may keep the default 0.5 threshold instead. State which threshold you chose and why.
+
+Do not use the test result to go back and choose a different model or threshold.
+
+```{r final-test}
+# Evaluate the upsampled logistic regression model on the test set
+# using the threshold chosen from validation data.
+
+final_test_predictions <- predict_with_threshold(upsampled_logistic_fit, test_data, threshold = best_threshold)
+calculate_metrics(final_test_predictions)
+onf_mat(final_test_predictions, truth = damp_grey_soil, estimate = .pred_class)
+```
+
+### Question 9: Methods and Limitations
+
+Answer in a short paragraph.
+
+1. Compare upsampling with class weighting and random undersampling.
+2. Where must resampling occur to avoid leakage when cross-validation is used?
+
+**Answer:**  
+TODO
+
+## Grading Rubric (25 points)
+
+| Component | Points |
+|---|---:|
+| Reproducibility, loading, and data checks | 2 |
+| Class-imbalance analysis | 3 |
+| Correct train/validation/test split and leakage explanation | 3 |
+| Logistic-regression workflows | 3 |
+| Baseline and model fitting | 2 |
+| Validation metrics and interpretation | 3 |
+| ROC and precision-recall curve interpretation | 2 |
+| Threshold comparison using validation data | 2 |
+| Final test evaluation | 2 |
+| Scientific interpretation and limitations | 3 |
+
+## Reproducibility Checklist
+
+Before submitting, confirm that:
+
+- [ ] The document knits without manual state from earlier sessions.
+- [ ] All `TODO` sections are complete.
+- [ ] Random seeds are fixed.
+- [ ] Preprocessing is fitted only through workflows on training data.
+- [ ] Upsampling occurs only inside the recipe/workflow.
+- [ ] Validation data, not test data, are used for model and threshold decisions.
+- [ ] The test set is evaluated only in the final section.
+- [ ] Metrics are interpreted for the positive class, damp grey soil.
+- [ ] Figures have readable titles and axis labels.
+- [ ] Scientific limitations and error costs are discussed.
+
+## Dataset Citation
+
+Srinivasan, A. (1993). Statlog (Landsat Satellite) [Dataset]. UCI Machine Learning Repository. https://doi.org/10.24432/C55887
