@@ -332,7 +332,6 @@ Answer these in a few sentences each.
 4. Which metric did we use to choose the best model?
 5. Did the model perform well? What evidence supports your answer?
 6. Look at the residual plot. Does the model make larger errors for younger or older abalone?
-7. Which predictors appear most important? Do those results make sense biologically?
 
 ## 6. Change the Pipeline
 
