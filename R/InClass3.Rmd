@@ -1,0 +1,380 @@
+---
+title: "Week 3 - In Class Activity: Spatial Autocorrelation with the Meuse Dataset"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+## Goal
+
+In this activity, you will open, explore, model, and diagnose spatial autocorrelation in a point dataset using R.
+
+We will use the Meuse dataset, which contains point observations of topsoil heavy-metal concentrations from a floodplain along the Meuse River near Stein, Netherlands. The data include spatial coordinates, heavy-metal concentrations such as zinc, cadmium, copper, and lead, plus environmental covariates such as distance to river, soil type, and flooding frequency.
+
+The central question is:
+
+**After fitting a simple non-spatial regression model, do the residuals still show spatial patterning?**
+
+If they do, then the model has not fully explained the spatial structure in zinc concentrations.
+
+## 1. Setup
+
+This activity uses `tidymodels`, the most common modern machine-learning framework in R. `tidymodels` provides a consistent workflow for preprocessing, modeling, fitting, prediction, and model evaluation.
+
+We also use several common spatial packages:
+
+- `sf` stores and maps spatial data.
+- `spdep` creates spatial neighbor weights and calculates Moran's I.
+- `gstat` calculates the variogram.
+- `ggplot2`, included with `tidymodels`, creates plots.
+
+```{r setup, message=FALSE, warning=FALSE}
+# Install packages if needed:
+# install.packages(c("tidymodels", "sf", "spdep", "gstat"))
+
+library(tidymodels)
+library(sf)
+library(spdep)
+library(gstat)
+
+theme_set(theme_minimal())
+```
+
+## 2. Load the Meuse Data
+
+The original `x` and `y` coordinates are in **EPSG:28992**, also called the Dutch national grid / RD New coordinate system.
+
+```{r load-data}
+meuse <- read.csv(
+  "https://raw.githubusercontent.com/dblaskey/ML_Course_Code/main/Data/meuse.csv"
+)
+
+meuse_sf <- st_as_sf(
+  meuse,
+  coords = c("x", "y"),
+  crs = 28992,
+  remove = FALSE
+)
+
+meuse_sf
+```
+
+### What to Notice
+
+After loading the data, we should have one row per soil sample. The `geometry` column stores the point location for each sample. The variables `x` and `y` are coordinates, while variables such as `zinc`, `cadmium`, `copper`, and `lead` are measured concentrations at those locations.
+
+Also notice which variables are categorical and which are continuous. Determine which columns would need to be converted to factors or dummy variables before modeling.
+
+Important variables:
+
+- `elev`: relative elevation above the local river bed in meters.
+- `dist`: normalized distance to the Meuse River, scaled between 0 and 1.
+- `dist.m`: actual distance to the Meuse River in meters.
+- `om`: organic matter content as a percentage.
+- `ffreq`: flooding frequency class.
+- `soil`: soil type. This should not be treated as a continuous numeric variable.
+- `lime`: lime class, where 0 = absent and 1 = present.
+- `landuse`: land use class.
+
+## 3. Data Exploration
+
+### Dataset Structure
+
+This summary tells us how many observations and variables are present, what the column names are, which variables are numeric or categorical, and whether there are missing values.
+
+```{r structure}
+glimpse(meuse_sf)
+
+cat("\nShape:\n")
+dim(meuse_sf)
+
+cat("\nMissing values per column:\n")
+colSums(is.na(meuse_sf)) %>% sort(decreasing = TRUE)
+```
+
+### Numeric Summaries
+
+Environmental concentration data are often right-skewed: a few locations may have much higher concentrations than most locations. That is one reason we later model `log_zinc` instead of raw `zinc`.
+
+```{r numeric-summary}
+# TODO: get numeric summaries for each numeric column.
+# Include count, mean, median, standard deviation, min, max, and useful quantiles.
+```
+
+### Pairwise Relationships
+
+The scatter matrix lets us compare zinc to distance from the river and to other metal concentrations.
+
+Typical patterns to look for:
+
+- Strong positive relationships among heavy metals may suggest a shared contamination process.
+- A relationship between `dist` and `zinc` may suggest that contamination is related to distance from the river.
+- Curved or fan-shaped relationships may suggest that a transformation, such as a logarithm, is useful.
+
+```{r scatter-matrix}
+pair_vars <- c("zinc", "cadmium", "dist", "elev", "om")
+
+meuse %>%
+  select(all_of(pair_vars)) %>%
+  drop_na() %>%
+  pairs(
+    main = "Scatter matrix of selected variables",
+    pch = 19,
+    col = rgb(0, 0, 0, 0.45)
+  )
+```
+
+### Spatial View
+
+This map places the sample points in their geographic positions and colors them by zinc concentration.
+
+Interpretation guide:
+
+- Points with similar colors near one another suggest spatial clustering.
+- Higher zinc values concentrated in one part of the floodplain suggest that location matters.
+- If high values occur near the river or flood-prone areas, that supports the idea that river transport and deposition may influence contamination.
+
+```{r zinc-map}
+ggplot(meuse_sf) +
+  geom_sf(aes(color = zinc), size = 2.4, alpha = 0.85) +
+  scale_color_viridis_c() +
+  labs(
+    title = "Meuse sample points colored by zinc concentration",
+    color = "Zinc"
+  )
+```
+
+## 4. Model Preprocessing and Regression
+
+We now build a simple non-spatial model for zinc concentration.
+
+The response variable is `log_zinc`, the natural logarithm of zinc. This transformation is common for concentration data because it reduces right-skewness and makes large values less dominant in the regression.
+
+The predictors are:
+
+- `dist`: distance to the river, treated as numeric.
+- `soil`: soil class, treated as categorical.
+- `ffreq`: flooding frequency class, treated here as ordinal numeric.
+- `elev`: relative elevation.
+- `om`: organic matter content.
+
+This model is intentionally simple. It asks:
+
+**How much of the zinc pattern can be explained by basic environmental covariates before explicitly modeling spatial dependence?**
+
+```{r prepare-model-data}
+df <- meuse_sf %>%
+  st_drop_geometry() %>%
+  mutate(
+    log_zinc = log(zinc),
+    soil = factor(soil),
+    ffreq = as.numeric(ffreq)
+  )
+
+feature_cols <- c("dist", "soil", "ffreq", "elev", "om")
+
+df %>%
+  select(log_zinc, all_of(feature_cols)) %>%
+  glimpse()
+```
+
+### Build the `tidymodels` Recipe and Workflow
+
+The recipe separates preprocessing from model fitting.
+
+For numeric predictors, the workflow imputes missing values with the median and standardizes the values. Standardization is not required for ordinary linear regression, but it is useful practice in many machine-learning workflows.
+
+For categorical predictors, the workflow fills missing values with the most common category and then creates dummy variables.
+
+```{r model-workflow}
+zinc_recipe <- recipe(log_zinc ~ dist + soil + ffreq + elev + om, data = df) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+lm_spec <- linear_reg() %>%
+  set_engine("lm")
+
+zinc_workflow <- workflow() %>%
+  add_recipe(zinc_recipe) %>%
+  add_model(lm_spec)
+
+zinc_workflow
+```
+
+### Fit the Model and Calculate Residuals
+
+After fitting the model, we calculate two quantities:
+
+- `pred_m1`: the model's predicted log zinc value.
+- `resid_m1`: the residual, calculated as observed log zinc minus predicted log zinc.
+
+Residuals are central to the spatial diagnostic step. If the model fully explains the systematic pattern in zinc, the residuals should look roughly random in space. If residuals are still spatially clustered, the model is missing spatial structure.
+
+```{r fit-model}
+zinc_fit <- fit(zinc_workflow, data = df)
+
+df <- df %>%
+  bind_cols(predict(zinc_fit, new_data = df)) %>%
+  rename(pred_m1 = .pred) %>%
+  mutate(resid_m1 = log_zinc - pred_m1)
+
+regression_metrics <- metric_set(rsq_trad, rmse)
+
+regression_metrics(
+  df,
+  truth = log_zinc,
+  estimate = pred_m1
+)
+```
+
+### Interpreting the Model Fit
+
+`R^2` measures the proportion of variation in `log_zinc` explained by the predictors. Larger values mean the model explains more variation, but `R^2` alone does not tell us whether the model assumptions are satisfied.
+
+`RMSE` measures the typical prediction error on the log-zinc scale. Smaller values indicate better fit.
+
+Important caution: these metrics are calculated after fitting and predicting on the same dataset. They describe in-sample fit, not out-of-sample predictive performance. That is why we also use cross-validation below.
+
+### Cross-Validation
+
+Cross-validation gives a more realistic estimate of predictive performance. The dataset is split into five parts. The model is trained on four parts and tested on the remaining part, repeated five times.
+
+The mean cross-validated `R^2` is usually lower than the in-sample `R^2`. If it is much lower, the model may not generalize well.
+
+```{r cross-validation}
+set.seed(42)
+
+folds <- vfold_cv(df, v = 5)
+
+cv_results <- fit_resamples(
+  zinc_workflow,
+  resamples = folds,
+  metrics = regression_metrics
+)
+
+collect_metrics(cv_results)
+```
+
+## 5. Spatial Diagnostics: Neighborhood Weights
+
+To measure spatial autocorrelation, we first define which observations are neighbors.
+
+Here, each sample point is connected to its six nearest neighboring points using k-nearest neighbors. The weights are row-standardized, meaning each point's neighbor weights sum to one.
+
+This step matters because Moran's I depends on the neighborhood definition. A different number of neighbors could produce slightly different results.
+
+```{r spatial-weights}
+coords <- df %>%
+  select(x, y) %>%
+  as.matrix()
+
+knn <- knearneigh(coords, k = 6)
+neighbors <- knn2nb(knn)
+weights <- nb2listw(neighbors, style = "W")
+```
+
+## 6. Moran's I
+
+Moran's I measures whether similar values occur near one another.
+
+Interpretation guide:
+
+- Positive Moran's I: nearby observations tend to have similar values, indicating clustering.
+- Moran's I near zero: little or no spatial autocorrelation.
+- Negative Moran's I: nearby observations tend to be dissimilar, indicating spatial dispersion or checkerboard-like patterning.
+- Small p-value, often below 0.05: the observed spatial pattern is unlikely under random spatial arrangement.
+
+We calculate Moran's I twice:
+
+1. For `log_zinc`, to test whether zinc itself is spatially clustered.
+2. For `resid_m1`, to test whether the regression residuals are still spatially clustered after accounting for distance, soil, flooding frequency, elevation, and organic matter.
+
+```{r morans-i}
+set.seed(42)
+
+moran_raw <- moran.mc(df$log_zinc, weights, nsim = 999)
+moran_resid <- moran.mc(df$resid_m1, weights, nsim = 999)
+
+moran_raw
+moran_resid
+```
+
+### Interpreting the Moran's I Results
+
+If `log_zinc` has a positive and statistically significant Moran's I, zinc concentrations are spatially clustered. That means nearby samples tend to have similar zinc levels.
+
+The residual Moran's I is the more important diagnostic for the regression model:
+
+- If residual Moran's I is not significant, then the covariates may have explained most of the spatial structure relevant to zinc.
+- If residual Moran's I is still positive and significant, then the model has missed spatial structure. This suggests that nearby residuals are similar and that a spatial modeling approach may be needed.
+
+In practical terms, significant residual spatial autocorrelation means the simple linear model may overstate how much independent information is present in the data. It can also produce overly optimistic uncertainty estimates because nearby observations are not fully independent.
+
+## 7. Variogram of Residuals
+
+A variogram describes how dissimilarity changes with distance. Here, we calculate a variogram for the model residuals.
+
+The y-axis shows semivariance, which is a measure of how different residuals are from one another. The x-axis shows distance between sample pairs.
+
+Interpretation guide:
+
+- If semivariance increases with distance, nearby residuals are more similar than distant residuals. This indicates spatial dependence.
+- If the curve levels off, the distance where it levels off is related to the spatial range of dependence.
+- A flat variogram suggests little spatial structure in the residuals.
+- A high semivariance at very short distances may suggest measurement error or microscale variation.
+
+```{r residual-variogram}
+vgm_resid <- variogram(
+  resid_m1 ~ 1,
+  locations = ~ x + y,
+  data = df
+)
+
+ggplot(vgm_resid, aes(x = dist, y = gamma)) +
+  geom_point(size = 2.5) +
+  geom_line() +
+  labs(
+    title = "Empirical Variogram of Model Residuals",
+    x = "Distance",
+    y = "Semivariance"
+  )
+```
+
+### Interpreting the Variogram Results
+
+The variogram complements Moran's I. Moran's I gives a single summary of spatial autocorrelation for a chosen neighborhood structure, while the variogram shows how spatial dependence changes over distance.
+
+If the residual variogram rises with distance before flattening out, the residuals still contain spatial structure. That means the simple non-spatial regression has not captured all of the geographic process affecting zinc.
+
+If the residual variogram is nearly flat, the residuals are not strongly distance-dependent. That would support the idea that the predictors explain most of the spatial pattern.
+
+Together, the Moran's I and variogram results help answer the main question of the activity:
+
+**Does a simple non-spatial model remove the spatial structure from zinc concentrations, or is a spatial model still needed?**
+
+## 8. Overall Discussion
+
+This workflow shows a common sequence in spatial data analysis:
+
+1. Explore the data. Understand the variables, distributions, missing values, and spatial layout.
+2. Fit a baseline non-spatial model. Use environmental covariates such as distance to river, soil type, and flooding frequency to explain zinc concentration.
+3. Examine residuals. Residuals show what the model did not explain.
+4. Test for spatial autocorrelation. Moran's I asks whether similar residuals occur near one another.
+5. Examine spatial dependence by distance. The variogram shows whether residual similarity changes as locations get farther apart.
+
+If both Moran's I and the variogram suggest residual spatial structure, then a more advanced model may be appropriate. Possible next steps include adding more predictors, using spatial lag or spatial error models, fitting a geostatistical model, or using kriging to model spatially structured residual variation.
+
+The most important lesson is that strong model performance metrics do not automatically mean the model is spatially appropriate. Spatial diagnostics are needed because geographic observations are often not independent.
+
+## 9. Reflection Questions
+
+1. Why did we model `log_zinc` instead of raw `zinc`?
+2. What does a positive Moran's I tell us about the spatial arrangement of values?
+3. Why do we check Moran's I on the residuals, not only on the original zinc values?
+4. If residual spatial autocorrelation remains, what does that imply about the regression model?
+5. How does the variogram add information beyond Moran's I?
+6. What might your next step be?
+
