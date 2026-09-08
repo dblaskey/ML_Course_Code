@@ -1,0 +1,302 @@
+---
+title: "Week 4 - Feature Engineering"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+## Goal
+
+Build a non-leaking feature for a gridded environmental dataset and compare model evaluation strategies.
+
+In this activity, you will use a gridded **sea surface temperature (SST)** dataset from oceanography. SST varies smoothly across space and seasonally through time, so nearby observations are not independent.
+
+**Dataset:** NOAA Extended Reconstructed Sea Surface Temperature version 5. NOAA describes ERSSTv5 as a global monthly SST analysis on a 2-degree grid derived from ICOADS, with records extending from 1854 to the present.
+
+Useful dataset references:
+
+- https://www.psl.noaa.gov/data/gridded/data.noaa.ersst.v5.html
+- https://downloads.psl.noaa.gov/Datasets/noaa.ersst.v5/sst.mnmean.nc
+
+## 1. Setup
+
+Run the chunk below. If any package is missing, uncomment the install line and run it once.
+
+This R Markdown document intentionally gives you some complete code and some incomplete code. Sections marked **TODO** are places where you should write or modify code yourself.
+
+```{r setup, message=FALSE, warning=FALSE}
+# Uncomment if needed:
+# install.packages(c("tidymodels", "terra", "lubridate", "ranger"))
+
+library(tidymodels)
+library(terra)
+library(lubridate)
+
+theme_set(theme_minimal())
+
+set.seed(42)
+```
+
+## 2. Load the Sea Surface Temperature Dataset
+
+The data are stored as a NetCDF file, which is common for gridded environmental and oceanographic data. Instead of rows and columns only, the data have dimensions such as `time`, `lat`, and `lon`.
+
+The SST variable is measured over a regular latitude-longitude grid through time.
+
+```{r load-data}
+sst_url <- "https://downloads.psl.noaa.gov/Datasets/noaa.ersst.v5/sst.mnmean.nc"
+sst_file <- "sst.mnmean.nc"
+
+download.file(sst_url, sst_file, mode = "wb")
+
+sst_all <- rast(sst_file, subds = "sst")
+sst_all
+```
+
+## 3. Subset the Data
+
+The full global dataset is larger than we need for this activity. The chunk below selects a broad Pacific Ocean region and thins the grid and time axis so the model runs quickly.
+
+We are still keeping enough data to preserve spatial and temporal correlation.
+
+```{r subset-data}
+sst_dates <- time(sst_all)
+
+keep_time <- which(
+  sst_dates >= as.Date("1992-01-01") &
+    sst_dates <= as.Date("2020-12-31")
+)
+
+# Keep every third month.
+keep_time <- keep_time[seq(1, length(keep_time), by = 3)]
+
+sst_sub <- sst_all[[keep_time]]
+
+# Select a broad Pacific region.
+# Longitude is stored from 0 to 360 degrees in this dataset.
+sst_sub <- crop(sst_sub, ext(120, 290, -60, 60))
+
+# Thin the grid by aggregating neighboring cells.
+sst_sub <- aggregate(sst_sub, fact = 2, fun = mean, na.rm = TRUE)
+
+dates_sub <- sst_dates[keep_time]
+names(sst_sub) <- paste0("t", seq_along(dates_sub))
+
+sst_sub
+```
+
+## 4. Explore the Data Visually
+
+Before modeling, inspect the target variable. SST has strong geographic structure and seasonal/temporal structure.
+
+The first plot shows the SST field for one time step. Nearby ocean cells usually have similar temperatures, which is spatial autocorrelation.
+
+```{r map-one-time}
+plot(sst_sub[[1]], main = paste("Sea surface temperature on", dates_sub[1]))
+```
+
+### Explore Change Through Time
+
+The next plot averages SST across the selected region for each time step. Because we kept every third month, the pattern will still show seasonal and long-term variation.
+
+```{r regional-mean}
+regional_mean <- global(sst_sub, fun = mean, na.rm = TRUE) %>%
+  as_tibble() %>%
+  mutate(time = dates_sub)
+
+ggplot(regional_mean, aes(x = time, y = mean)) +
+  geom_line() +
+  labs(
+    title = "Regional mean SST over time",
+    x = "Time",
+    y = "SST"
+  )
+```
+
+## 5. Convert Gridded Data to a Machine-Learning Table
+
+Most machine-learning models expect a table where each row is one observation. Here, one row represents one grid cell at one time.
+
+The target is `sst`. The predictors will be simple features based on location and time.
+
+We create cyclic features for month because December is close to January.
+
+```{r make-table}
+df_wide <- as.data.frame(sst_sub, xy = TRUE, na.rm = TRUE)
+
+date_lookup <- tibble(
+  layer = names(sst_sub),
+  time = dates_sub
+)
+
+df <- df_wide %>%
+  pivot_longer(
+    cols = starts_with("t"),
+    names_to = "layer",
+    values_to = "sst"
+  ) %>%
+  left_join(date_lookup, by = "layer") %>%
+  rename(lon = x, lat = y) %>%
+  mutate(
+    year = year(time),
+    month = month(time)
+  )
+
+# TODO: create month_sin and month_cos features.
+# Hint: use sin(2 * pi * month / 12) and cos(2 * pi * month / 12).
+
+df <- df %>%
+  mutate(
+    month_sin = # TODO: replace with month sine feature
+    month_cos = # TODO: replace with month cosine feature
+  )
+
+dim(df)
+head(df)
+```
+
+## 6. Define the Prediction Problem
+
+We will predict SST from simple location and time features.
+
+This is not meant to be the best possible ocean forecasting model. The goal is to study how evaluation changes when data are spatially and temporally correlated.
+
+```{r define-problem}
+feature_cols <- c(
+  "lat",
+  "lon",
+  "month_sin",
+  "month_cos",
+  "year"
+)
+
+target_col <- "sst"
+
+model_data <- df %>%
+  select(all_of(feature_cols), all_of(target_col))
+
+head(model_data)
+```
+
+## 7. Create a Reusable Model and Evaluation Function
+
+We use a tree-based regression model through `tidymodels`. The `ranger` engine fits a random forest. It can capture nonlinear patterns such as warmer temperatures near the equator and seasonal variation.
+
+The helper function below runs resampling and returns RMSE, MAE, and traditional R-squared.
+
+Interpretation of metrics:
+
+- **RMSE:** Typical prediction error, with larger errors penalized more strongly.
+- **MAE:** Typical absolute error.
+- **R-squared:** Fraction of variance explained. Higher is better, but it can be misleading when validation folds are not independent.
+
+```{r modeling-helpers}
+regression_metrics <- metric_set(rmse, mae, rsq_trad)
+
+make_workflow <- function(features) {
+  formula_text <- paste("sst ~", paste(features, collapse = " + "))
+
+  sst_recipe <- recipe(as.formula(formula_text), data = model_data) %>%
+    step_impute_median(all_numeric_predictors())
+
+  rf_spec <- rand_forest(
+    trees = 200,
+    min_n = 5
+  ) %>%
+    set_engine("ranger") %>%
+    set_mode("regression")
+
+  workflow() %>%
+    add_recipe(sst_recipe) %>%
+    add_model(rf_spec)
+}
+
+summarize_resamples <- function(results, label) {
+  collect_metrics(results) %>%
+    filter(.metric %in% c("rmse", "mae", "rsq_trad")) %>%
+    mutate(Evaluation = label) %>%
+    select(Evaluation, .metric, mean, std_err)
+}
+```
+
+## 8. Naive Evaluation: Random k-Fold Cross-Validation
+
+Run the chunk below and record the results.
+
+Random k-fold cross-validation mixes nearby places and nearby times across folds. That can make performance look better than it would be when predicting genuinely new regions or future periods.
+
+```{r random-cv}
+set.seed(42)
+
+random_folds <- vfold_cv(model_data, v = 5)
+
+random_results <- fit_resamples(
+  make_workflow(feature_cols),
+  resamples = random_folds,
+  metrics = regression_metrics
+)
+
+random_summary <- summarize_resamples(random_results, "Random k-fold CV")
+random_summary
+```
+
+## 9. Feature Engineering
+
+TODO: Add a historic monthly average temperature for each location.
+
+Be careful not to use future data when creating this column. For each grid cell and month, the value should be based only on previous observations from the same grid cell and calendar month.
+
+```{r historic-monthly-average}
+df <- df %>%
+  arrange(lat, lon, month, time) %>%
+  group_by(lat, lon, month) %>%
+  mutate(
+    Month_Average_sst = # TODO: replace with historical monthly average
+  ) %>%
+  ungroup() %>%
+  drop_na()
+
+df %>%
+  select(lat, lon, time, month, sst, Month_Average_sst) %>%
+  arrange(lat, lon, month, time) %>%
+  head(15)
+```
+
+Hint: one safe pattern is to combine `cummean()` with `lag()` so the current row is not included in its own historical average.
+
+```{r updated-feature-set}
+feature_cols <- c(
+  "lat",
+  "lon",
+  "month_cos",
+  "month_sin",
+  "year",
+  "Month_Average_sst"
+)
+
+model_data <- df %>%
+  select(all_of(feature_cols), all_of(target_col))
+
+head(model_data)
+```
+
+```{r random-cv-with-feature}
+set.seed(42)
+
+random_folds <- vfold_cv(model_data, v = 5)
+
+random_results_with_feature <- fit_resamples(
+  make_workflow(feature_cols),
+  resamples = random_folds,
+  metrics = regression_metrics
+)
+
+random_summary_with_feature <- summarize_resamples(
+  random_results_with_feature,
+  "Random k-fold CV with historical monthly mean"
+)
+
+random_summary_with_feature
+```
+
