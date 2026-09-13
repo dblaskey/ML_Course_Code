@@ -144,7 +144,6 @@ df <- df_wide %>%
   )
 
 # TODO: create month_sin and month_cos features.
-# Hint: use sin(2 * pi * month / 12) and cos(2 * pi * month / 12).
 
 df <- df %>%
   mutate(
