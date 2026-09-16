@@ -1,0 +1,615 @@
+---
+title: "Homework 4: Spatial and Temporal Blocking for Model Evaluation"
+author: "GEOL 599: Machine Learning"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# If needed, install these packages first:
+# install.packages(c("tidyverse", "tidymodels", "terra", "ranger", "gstat", "sf", "sp"))
+
+library(tidyverse)
+library(tidymodels)
+library(terra)
+library(ranger)
+library(gstat)
+library(sf)
+library(sp)
+
+tidymodels_prefer()
+set.seed(42)
+```
+
+# Goal
+
+Compare ordinary random cross-validation with blocked cross-validation for spatially and temporally correlated environmental data.
+
+In this homework, you will use a gridded **sea surface temperature (SST)** dataset. SST is a good example because nearby ocean grid cells tend to have similar temperatures, and nearby months or years are also related. This means ordinary random cross-validation can give an overly optimistic estimate of model performance.
+
+Sections marked **TODO** are places where you should write or modify code.
+
+# 1. Load the Sea Surface Temperature Dataset
+
+The data are stored as a NetCDF file, a common format for gridded environmental and oceanographic data. Instead of rows and columns only, the data have dimensions such as `time`, `lat`, and `lon`.
+
+```{r load-data}
+data_url <- "https://raw.githubusercontent.com/dblaskey/ML_Course_Code/main/Data/sst.nc"
+file_path <- "sst.nc"
+
+if (!file.exists(file_path)) {
+  download.file(data_url, destfile = file_path, mode = "wb")
+}
+
+sst_rast <- rast(file_path)
+sst_rast
+```
+
+The SST variable is stored as a multilayer raster. Each layer represents one time step.
+
+```{r inspect-raster}
+nlyr(sst_rast)
+ext(sst_rast)
+res(sst_rast)
+time(sst_rast)
+```
+
+## Discussion
+
+Look at the dataset metadata above.
+
+Questions to answer:
+
+1. What are the dimensions of the dataset?
+2. What is the spacing between latitude and longitude grid cells?
+3. How many time steps are included?
+4. Why might neighboring grid cells have similar SST values?
+
+**Your answer:** TODO
+
+# 2. Explore the Data Visually
+
+Before modeling, inspect the target variable. SST has strong geographic structure and seasonal/temporal structure. The first plot shows the SST field for one time step.
+
+```{r map-one-time, fig.width=9, fig.height=5}
+one_time <- sst_rast[[1]]
+
+plot(one_time, main = paste("Sea surface temperature:", names(one_time)))
+```
+
+The next plot averages SST across the selected region for each time step.
+
+```{r regional-mean}
+regional_mean <- global(sst_rast, fun = "mean", na.rm = TRUE) %>%
+  as_tibble() %>%
+  mutate(
+    layer = row_number(),
+    date = time(sst_rast)
+  )
+
+ggplot(regional_mean, aes(x = date, y = mean)) +
+  geom_line() +
+  labs(
+    title = "Regional mean SST over time",
+    x = "Date",
+    y = "Mean SST"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## TODO: Describe the Correlation Structure
+
+Write a short answer after running the plots.
+
+**Prompt:** Based on the maps and time series, where do you expect random cross-validation to be misleading? Consider both nearby locations and nearby times.
+
+**Your answer:** TODO
+
+# 3. Convert Gridded Data to a Machine-Learning Table
+
+Most `tidymodels` workflows expect a table where each row is one observation. Here, one row will represent one grid cell at one time. The target is `sst`. The predictors will be simple features based on location, season, and time.
+
+```{r raster-to-table}
+# Convert raster layers to a wide table with x/y columns and one column per time step.
+sst_wide <- as.data.frame(sst_rast, xy = TRUE, na.rm = FALSE) %>%
+  as_tibble() %>%
+  rename(lon = x, lat = y)
+
+# Use raster time metadata when available.
+sst_dates <- time(sst_rast)
+
+# Pivot from wide raster format to long machine-learning format.
+df <- sst_wide %>%
+  pivot_longer(
+    cols = -c(lon, lat),
+    names_to = "layer",
+    values_to = "sst"
+  ) %>%
+  drop_na(sst) %>%
+  mutate(
+    layer_index = as.integer(factor(layer, levels = names(sst_rast))),
+    time = sst_dates[layer_index],
+    year = lubridate::year(time),
+    month = lubridate::month(time),
+    time_index = (year - min(year, na.rm = TRUE)) * 12 + (month - 1),
+    month_sin = sin(2 * pi * month / 12),
+    month_cos = cos(2 * pi * month / 12),
+    lon_sin = sin(2 * pi * lon / 360),
+    lon_cos = cos(2 * pi * lon / 360)
+  )
+
+dim(df)
+head(df)
+```
+
+## Quick Table Checks
+
+Use this section to understand the rows that the machine-learning model will see.
+
+```{r table-checks}
+cat("Number of rows:", nrow(df), "\n")
+cat("Number of years:", n_distinct(df$year), "\n")
+cat("Years:", min(df$year), "to", max(df$year), "\n")
+cat("Number of grid locations:", n_distinct(paste(df$lat, df$lon)), "\n")
+
+summary(df$sst)
+```
+
+## TODO: Additional Exploration
+
+Add at least two exploratory checks of your own.
+
+Examples:
+
+- Plot SST versus latitude.
+- Plot SST versus month.
+- Compare SST distributions for different years.
+- Map a different time step.
+- Compute average SST by latitude band.
+
+```{r additional-exploration}
+# TODO: Add at least two exploratory checks of your own.
+
+```
+
+## TODO: Historical Monthly SST Feature
+
+Create a historical average SST feature for each location and month. Be careful not to use future data when creating this column.
+
+The idea is:
+
+1. Group by location and month.
+2. Sort by time.
+3. Compute the cumulative mean from previous observations only.
+4. Use `lag()` so the current observation is not used to predict itself.
+
+```{r historical-monthly-feature}
+# TODO: Create Month_Average_sst without using future data.
+# Hint: use lag(cummean(sst)).
+
+# Example scaffold:
+df <- df %>%
+   group_by(lat, lon, month) %>%
+   mutate(Month_Average_sst = #TODO) %>%
+   ungroup()
+
+df <- df %>%
+  drop_na(Month_Average_sst)
+
+```
+
+# 4. Define the Prediction Problem
+
+We will predict SST from simple location and time features. This is not meant to be the best possible ocean forecasting model. The goal is to study how evaluation changes when data are spatially and temporally correlated.
+
+```{r prediction-problem}
+feature_cols <- c(
+  "lat",
+  "lon_sin",
+  "lon_cos",
+  "month_sin",
+  "month_cos",
+  "time_index",
+  "Month_Average_sst"
+)
+
+target_col <- "sst"
+
+# If Month_Average_sst does not exist yet, stop with a helpful reminder.
+stopifnot("Month_Average_sst" %in% names(df))
+
+model_data <- df %>%
+  select(all_of(c(target_col, feature_cols, "year", "lat", "lon", "time"))) %>%
+  mutate(row_id = row_number())
+
+head(model_data)
+```
+
+# 5. Create a Reusable Model Workflow
+
+We will use a tree-based regression model. Tree-based models can capture nonlinear patterns such as warmer temperatures near the equator and seasonal variation.
+
+In `tidymodels`, we define:
+
+- a **recipe** for preprocessing,
+- a **model specification**, and
+- a **workflow** that combines them.
+
+```{r workflow}
+sst_recipe <- recipe(sst ~ lat + lon_sin + lon_cos + month_sin + month_cos + time_index + Month_Average_sst,
+                     data = model_data) %>%
+  step_impute_median(all_numeric_predictors())
+
+rf_spec <- rand_forest(
+  trees = 300,
+  min_n = 5,
+  mtry = 4
+) %>%
+  set_mode("regression") %>%
+  set_engine("ranger", importance = "impurity")
+
+sst_workflow <- workflow() %>%
+  add_recipe(sst_recipe) %>%
+  add_model(rf_spec)
+
+sst_workflow
+```
+
+```{r helper-functions}
+summarize_resamples <- function(resample_results, label) {
+  collect_metrics(resample_results) %>%
+    select(.metric, mean, std_err) %>%
+    pivot_wider(
+      names_from = .metric,
+      values_from = c(mean, std_err)
+    ) %>%
+    transmute(
+      Evaluation = label,
+      `Mean RMSE` = mean_rmse,
+      `SE RMSE` = std_err_rmse,
+      `Mean MAE` = mean_mae,
+      `Mean R2` = mean_rsq
+    )
+}
+
+regression_metrics <- metric_set(rmse, mae, rsq)
+```
+
+# 6. Naive Evaluation: Random k-Fold Cross-Validation
+
+Random k-fold cross-validation mixes observations from different locations and times into each fold. This is common in introductory machine learning, but it is often too optimistic for spatial-temporal data because very similar observations may appear in both training and test folds.
+
+
+```{r random-cv}
+random_cv <- vfold_cv(model_data, v = 5)
+
+random_results <- fit_resamples(
+  sst_workflow,
+  resamples = random_cv,
+  metrics = regression_metrics,
+  control = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(random_results)
+```
+
+```{r random-summary}
+random_summary <- summarize_resamples(random_results, "Random k-fold CV")
+random_summary
+```
+
+## Discussion: Random CV
+
+Questions:
+
+1. What is the average RMSE under random k-fold CV?
+2. Why might this number be too optimistic?
+3. In this dataset, what kinds of information can leak from the training folds into the test fold?
+
+**Your answer:** TODO
+
+# 7. Temporal Block Cross-Validation
+
+Now we will hold out entire years. This asks a different question:
+
+> Can the model generalize to years it has not seen during training?
+
+This is a better approximation of forecasting or prediction into future time periods than random cross-validation.
+
+```{r temporal-block-cv}
+# TODO: Complete temporal block cross-validation.
+
+# Step 1: create grouped folds by year.
+temporal_cv <- NULL # replace NULL with group_vfold_cv(...)
+
+# Step 2: run blocked cross-validation.
+temporal_results <- NULL # replace NULL with fit_resamples(...)
+
+# Step 3: display the results.
+temporal_results
+```
+
+## TODO: Summarize Temporal CV
+
+Use `summarize_resamples()` to create a one-row summary for temporal block CV.
+
+```{r temporal-summary}
+# TODO: Summarize your temporal CV results.
+temporal_summary <- NULL
+
+temporal_summary
+```
+
+## Discussion: Temporal Blocking
+
+Questions:
+
+1. Is temporal block CV better or worse than random CV?
+2. What does the difference tell you?
+3. Does the model appear to generalize well to unseen years?
+4. Would this be a fair test if your real goal were to predict future years?
+
+**Your answer:** TODO
+
+# 8. Spatial Block Cross-Validation
+
+Now we will hold out entire regions. This asks:
+
+> Can the model generalize to locations it has not seen during training?
+
+Spatial blocking is useful when your real prediction task involves mapping unsampled locations or transferring a model to a new region.
+
+## TODO: Variogram of Residuals
+
+Use cross-validated residuals from the random CV model to estimate the spatial scale of residual autocorrelation. This avoids using purely in-sample residuals, which can understate model error.
+
+**Hint:** Look back at the earlier spatial regression activity. One reasonable approach is:
+
+1. Fit the workflow once to the full modeling table.
+2. Predict SST for the same rows.
+3. Compute residuals.
+4. Convert one time step, or a sample of residuals, into an `sf`/`sp` object.
+5. Use `gstat::variogram()`.
+
+```{r residual-variogram, fig.width=7, fig.height=5}
+# TODO: Create a variogram of model residuals to estimate spatial autocorrelation distance. 
+
+random_predictions <- collect_predictions(random_results)
+
+residual_data <- random_predictions %>%
+  mutate(residual = sst - .pred) %>%
+  left_join(
+    model_data %>%
+      mutate(.row = row_number()) %>%
+      select(.row, lat, lon, time),
+    by = ".row"
+  )
+
+residual_one_time <- residual_data %>%
+  filter(time == min(time)) %>%
+  sample_n(size = min(3000, n()))
+
+residual_sf <- st_as_sf(
+  residual_one_time,
+  coords = c("lon", "lat"),
+  crs = 4326
+) %>%
+  st_transform(3857)
+
+residual_sp <- as(residual_sf, "Spatial")
+
+residual_variogram <- #TODO: Use variogram()
+
+plot(residual_variogram, main = "Variogram of cross-validated residuals")
+```
+
+## Create Spatial Blocks
+
+Once you have estimated the extent of spatial autocorrelation, use that information to set the block size.
+
+```{r create-spatial-blocks}
+# TODO: choose block sizes based on your variogram or exploratory reasoning.
+lat_block_size <- NULL # replace NULL with a numeric block size, such as 5
+lon_block_size <- NULL # replace NULL with a numeric block size, such as 5
+
+model_data <- model_data %>%
+  mutate(
+    lat_block = floor((lat + 90) / lat_block_size),
+    lon_block = floor(lon / lon_block_size),
+    spatial_block = paste(lat_block, lon_block, sep = "_")
+  )
+
+cat("Number of spatial blocks:", n_distinct(model_data$spatial_block), "\n")
+
+model_data %>%
+  select(lat, lon, lat_block, lon_block, spatial_block) %>%
+  distinct() %>%
+  head()
+```
+
+## Visualize the Spatial Blocks
+
+Each point below is one grid location. The colors represent block IDs, not physical values.
+
+```{r plot-spatial-blocks, fig.width=9, fig.height=5}
+block_map <- model_data %>%
+  distinct(lat, lon, spatial_block) %>%
+  mutate(block_code = as.integer(factor(spatial_block)))
+
+ggplot(block_map, aes(x = lon, y = lat, color = block_code)) +
+  geom_point(size = 2) +
+  coord_equal() +
+  scale_color_viridis_c() +
+  labs(
+    title = "Spatial blocks used for cross-validation",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Block ID"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Coding Task: Spatial Block CV
+
+Complete the spatial block cross-validation.
+
+Hints:
+
+- Use `group_vfold_cv()` again.
+- The grouping variable should be `spatial_block`.
+- The block columns are used only to define folds; they are not predictors in the recipe.
+
+```{r spatial-block-cv}
+# TODO: Complete spatial block cross-validation.
+
+# Step 1: create grouped folds by spatial block.
+spatial_cv <- NULL # replace NULL with group_vfold_cv(...)
+
+# Step 2: run blocked cross-validation.
+spatial_results <- NULL # replace NULL with fit_resamples(...)
+
+# Step 3: display the results.
+spatial_results
+```
+
+## Coding Task: Summarize Spatial CV
+
+Use `summarize_resamples()` to create a one-row summary for spatial block CV.
+
+```{r spatial-summary}
+# TODO: Summarize your spatial CV results.
+spatial_summary <- NULL
+
+spatial_summary
+```
+
+## Discussion: Spatial Blocking
+
+Questions:
+
+1. Is spatial block CV better or worse than random CV?
+2. What does this say about the model's ability to predict in new locations?
+3. Why is latitude likely such a powerful predictor of SST?
+4. Why might a model still perform well in spatial blocks if the region has a strong latitudinal gradient?
+
+**Your answer:** TODO
+
+# 9. Spatial-Temporal Holdout
+
+Spatial blocking asks whether the model can generalize to new places. Temporal blocking asks whether the model can generalize to new years. A spatial-temporal holdout combines both ideas.
+
+Here we create a stricter test: the test data must come from held-out spatial blocks **and** held-out years. The training data exclude those spatial blocks and those years.
+
+```{r strict-spatiotemporal-function}
+make_strict_spatiotemporal_splits <- function(data, spatial_col = "spatial_block", time_col = "year", v = 5) {
+  spatial_blocks <- sort(unique(data[[spatial_col]]))
+  time_blocks <- sort(unique(data[[time_col]]))
+
+  spatial_fold_ids <- sample(rep(seq_len(v), length.out = length(spatial_blocks)))
+  time_fold_ids <- sample(rep(seq_len(v), length.out = length(time_blocks)))
+
+  spatial_lookup <- tibble(
+    spatial_block_value = spatial_blocks,
+    spatial_fold = spatial_fold_ids
+  )
+
+  time_lookup <- tibble(
+    time_block_value = time_blocks,
+    time_fold = time_fold_ids
+  )
+
+  split_list <- vector("list", v)
+
+  for (fold_id in seq_len(v)) {
+    heldout_spatial <- spatial_lookup %>%
+      filter(spatial_fold == fold_id) %>%
+      pull(spatial_block_value)
+
+    heldout_time <- time_lookup %>%
+      filter(time_fold == fold_id) %>%
+      pull(time_block_value)
+
+    assessment_idx <- which(data[[spatial_col]] %in% heldout_spatial & data[[time_col]] %in% heldout_time)
+    analysis_idx <- which(!(data[[spatial_col]] %in% heldout_spatial) & !(data[[time_col]] %in% heldout_time))
+
+    split_list[[fold_id]] <- make_splits(
+      list(analysis = analysis_idx, assessment = assessment_idx),
+      data = data
+    )
+  }
+
+  manual_rset(
+    splits = split_list,
+    ids = paste0("Fold", seq_len(v))
+  )
+}
+```
+
+```{r strict-spatiotemporal-cv}
+strict_st_cv <- make_strict_spatiotemporal_splits(
+  model_data,
+  spatial_col = "spatial_block",
+  time_col = "year",
+  v = 5
+)
+
+strict_st_results <- fit_resamples(
+  sst_workflow,
+  resamples = strict_st_cv,
+  metrics = regression_metrics,
+  control = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(strict_st_results)
+```
+
+```{r strict-spatiotemporal-summary}
+strict_st_summary <- summarize_resamples(strict_st_results, "Spatial-temporal block CV")
+strict_st_summary
+```
+
+## Discussion: Spatial-Temporal Holdout
+
+The spatial-temporal holdout is the hardest evaluation in this homework because the model is asked to predict observations from a region and years that were excluded from training.
+
+If this error is much larger than the random CV error, that is not a failure of the model. It is evidence that the original random CV estimate was answering an easier question.
+
+# 10. Compare All Evaluation Strategies
+
+After you complete the temporal, spatial, and spatial-temporal sections, combine the summary tables.
+
+```{r compare-strategies}
+# Combine all summaries into one table.
+comparison <- bind_rows(
+  random_summary,
+  temporal_summary,
+  spatial_summary,
+  strict_st_summary
+)
+
+comparison
+```
+
+## Plot the Comparison
+
+Complete the plotting code below. You should produce a bar chart of mean RMSE for the evaluation strategies.
+
+```{r plot-comparison, fig.width=8, fig.height=4}
+# TODO: Create a bar chart of Mean RMSE by Evaluation strategy.
+# Hint: use ggplot(comparison, aes(x = Evaluation, y = `Mean RMSE`)) + geom_col()
+
+```
+
+# 11. Final Reflection
+
+Write a brief paragraph answering the following:
+
+1. Which evaluation strategy gave the most optimistic result?
+2. Which evaluation strategy gave the most conservative result?
+3. Which strategy best matches a forecasting problem?
+4. Which strategy best matches prediction at unsampled locations?
+5. Why should environmental scientists be cautious when reporting random cross-validation accuracy for spatial or temporal datasets?
+
+**Your answer:** TODO
