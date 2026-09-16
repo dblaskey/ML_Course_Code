@@ -1,0 +1,393 @@
+---
+title: "In-Class Activity 5: Logistic Regression and Support Vector Machines"
+author: "GEOL 599: Machine Learning"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# If needed, install these packages first:
+# install.packages(c("tidyverse", "tidymodels", "kernlab"))
+
+library(tidyverse)
+library(tidymodels)
+library(kernlab)
+
+tidymodels_prefer()
+set.seed(30)
+```
+
+# Overview
+
+In this activity, you will compare **logistic regression** and **support vector machines (SVMs)** using the Palmer Penguins dataset.
+
+The dataset contains field measurements from penguins observed in Antarctica. We will use two bill measurements to classify penguin species and visualize how different SVM kernels change the decision boundary.
+
+## Learning Goals
+
+By the end of this activity, you should be able to:
+
+- Fit a logistic regression classifier with `tidymodels`.
+- Fit SVM classifiers with linear, polynomial, and radial basis function kernels.
+- Explain why feature scaling matters for SVMs.
+- Compare model performance using accuracy, confusion matrices, precision, recall, and F1-score.
+- Visualize how different SVM kernels change the decision boundary.
+
+# Load the Dataset
+
+We will use the Palmer Penguins dataset. The dataset is loaded from a CSV file.
+
+```{r load-data}
+data_url <- "https://raw.githubusercontent.com/dblaskey/ML_Course_Code/main/Data/penguins.csv"
+
+penguins <- read_csv(data_url, show_col_types = FALSE)
+
+glimpse(penguins)
+```
+
+# Prepare a Binary Classification Problem
+
+To make the decision boundaries easy to visualize, we will classify only two species:
+
+- `Chinstrap`
+- `Gentoo`
+
+We will use two predictors:
+
+- `bill_length_mm`
+- `bill_depth_mm`
+
+This is a simplified model. In a real analysis, we might use more predictors, but using two features lets us plot the decision boundary directly.
+
+```{r prepare-data}
+species_to_keep <- c("Chinstrap", "Gentoo")
+
+penguins_binary <- penguins %>%
+  filter(species %in% species_to_keep) %>%
+  select(species, bill_length_mm, bill_depth_mm) %>%
+  drop_na() %>%
+  mutate(species = factor(species, levels = species_to_keep))
+
+penguins_binary %>%
+  slice_head(n = 6)
+```
+
+## Question 1
+
+How many observations are in each class? Is the dataset balanced?
+
+**Hint:** Use `count()` on the target column.
+
+```{r question-1}
+# TODO: count the number of observations in each species class
+
+```
+
+# Visualize the Data
+
+Before fitting models, plot the two predictors. This helps us anticipate whether a linear boundary might work.
+
+```{r plot-data}
+ggplot(penguins_binary, aes(x = bill_length_mm, y = bill_depth_mm, color = species)) +
+  geom_point(size = 3, alpha = 0.9) +
+  labs(
+    title = "Palmer Penguins: Two-Species Classification Problem",
+    x = "Bill length (mm)",
+    y = "Bill depth (mm)",
+    color = "Species"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Question 2
+
+Based on the scatterplot, do you expect a linear classifier to work well? Why or why not?
+
+# Train/Test Split
+
+Now split the data into training and testing sets.
+
+Use `strata = species` so that both the training and testing sets preserve the class proportions.
+
+```{r split-data}
+# TODO: create a train/test split
+# Use prop = 0.75 and strata = species
+
+penguin_split <- initial_split(penguins_binary, prop = 0.75, strata = 'species')
+
+train_data <- training(penguin_split)
+test_data <- testing(penguin_split)
+
+train_data %>% count(species)
+test_data %>% count(species)
+```
+
+# Preprocessing Recipe
+
+SVMs are sensitive to feature scale, so we will normalize the numeric predictors. Logistic regression also benefits from this when we want to compare coefficients or model behavior across predictors.
+
+```{r recipe}
+penguin_recipe <- recipe(species ~ bill_length_mm + bill_depth_mm, data = train_data) %>%
+  step_normalize(all_numeric_predictors())
+
+penguin_recipe
+```
+
+# Define the Models
+
+We will compare four classifiers:
+
+1. Logistic regression
+2. Linear SVM
+3. Polynomial-kernel SVM
+4. RBF-kernel SVM
+
+In R, these models are specified with `parsnip` and then combined with the preprocessing recipe using a `workflow()`.
+
+```{r model-specs}
+model_specs <- list(
+  "Logistic regression" = logistic_reg() %>%
+    set_mode("classification") %>%
+    set_engine("glm"),
+
+  "Linear SVM" = svm_linear(cost = 1) %>%
+    set_mode("classification") %>%
+    set_engine("kernlab"),
+
+  "Polynomial SVM" = svm_poly(cost = 1, degree = 3, scale_factor = 1) %>%
+    set_mode("classification") %>%
+    set_engine("kernlab"),
+
+  "RBF SVM" = svm_rbf(cost = 1, rbf_sigma = 0.1) %>%
+    set_mode("classification") %>%
+    set_engine("kernlab")
+)
+```
+
+# Fit and Evaluate the Models
+
+Fit each model on the training data and evaluate it on the test data.
+
+```{r fit-models}
+fit_one_model <- function(model_spec) {
+  workflow() %>%
+    add_recipe(penguin_recipe) %>%
+    add_model(model_spec) %>%
+    fit(data = train_data)
+}
+
+model_fits <- map(model_specs, fit_one_model)
+```
+
+```{r test-predictions}
+test_predictions <- imap_dfr(
+  model_fits,
+  function(fitted_workflow, model_name) {
+    predict(fitted_workflow, test_data, type = "class") %>%
+      bind_cols(test_data %>% select(species)) %>%
+      mutate(model = model_name)
+  }
+)
+
+test_predictions %>%
+  slice_head(n = 10)
+```
+
+```{r accuracy-results}
+accuracy_results <- test_predictions %>%
+  group_by(model) %>%
+  accuracy(truth = species, estimate = .pred_class) %>%
+  arrange(desc(.estimate))
+
+accuracy_results
+```
+
+## Question 3
+
+Which model has the highest test accuracy? Are the differences large enough to be meaningful?
+
+# Confusion Matrices
+
+Accuracy is useful, but it does not show which classes are being confused. Create a confusion matrix for each model.
+
+```{r confusion-matrices}
+confusion_data <- test_predictions %>%
+  group_by(model) %>%
+  conf_mat(truth = species, estimate = .pred_class)
+
+confusion_data
+```
+
+```{r plot-confusion-matrices}
+confusion_plot_data <- test_predictions %>%
+  count(model, species, .pred_class, name = "n") %>%
+  complete(model, species, .pred_class, fill = list(n = 0))
+
+ggplot(confusion_plot_data, aes(x = .pred_class, y = species, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = n), size = 5) +
+  facet_wrap(~ model) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(
+    title = "Confusion Matrices",
+    x = "Predicted species",
+    y = "Observed species",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Question 4
+
+Do any models make noticeably different types of mistakes? Explain using the confusion matrices.
+
+# Classification Metrics
+
+A classification summary gives metrics such as precision, recall, and F1-score.
+
+```{r classification-metrics}
+classification_metrics <- metric_set(accuracy, precision, recall, f_meas)
+
+class_metric_results <- test_predictions %>%
+  group_by(model) %>%
+  classification_metrics(truth = species, estimate = .pred_class)
+
+class_metric_results
+```
+
+# Visualize Decision Boundaries
+
+The function below draws the classification regions learned by each model.
+
+The background color shows the predicted class across the feature space. The points show the actual observations.
+
+- Circles = training data
+- X symbols = test data
+- Point color = observed species
+- Background color = model-predicted species
+
+```{r decision-boundary-function}
+plot_decision_boundary <- function(fitted_workflow, train_data, test_data, title) {
+  x_min <- min(train_data$bill_length_mm, test_data$bill_length_mm) - 1
+  x_max <- max(train_data$bill_length_mm, test_data$bill_length_mm) + 1
+  y_min <- min(train_data$bill_depth_mm, test_data$bill_depth_mm) - 1
+  y_max <- max(train_data$bill_depth_mm, test_data$bill_depth_mm) + 1
+
+  prediction_grid <- expand_grid(
+    bill_length_mm = seq(x_min, x_max, length.out = 250),
+    bill_depth_mm = seq(y_min, y_max, length.out = 250)
+  )
+
+  grid_predictions <- predict(fitted_workflow, prediction_grid, type = "class") %>%
+    bind_cols(prediction_grid)
+
+  points_data <- bind_rows(
+    train_data %>% mutate(split = "Training data"),
+    test_data %>% mutate(split = "Test data")
+  )
+
+  ggplot() +
+    geom_raster(
+      data = grid_predictions,
+      aes(x = bill_length_mm, y = bill_depth_mm, fill = .pred_class),
+      alpha = 0.25
+    ) +
+    geom_point(
+      data = points_data,
+      aes(x = bill_length_mm, y = bill_depth_mm, color = species, shape = split),
+      size = 3,
+      stroke = 1
+    ) +
+    scale_fill_manual(values = c("Chinstrap" = "#56B4E9", "Gentoo" = "#E69F00")) +
+    scale_color_manual(values = c("Chinstrap" = "#0072B2", "Gentoo" = "#D55E00")) +
+    scale_shape_manual(values = c("Training data" = 16, "Test data" = 4)) +
+    labs(
+      title = title,
+      x = "Bill length (mm)",
+      y = "Bill depth (mm)",
+      fill = "Predicted species",
+      color = "Observed species",
+      shape = "Dataset split"
+    ) +
+    coord_cartesian(xlim = c(x_min, x_max), ylim = c(y_min, y_max)) +
+    theme_minimal(base_size = 12)
+}
+```
+
+```{r plot-decision-boundaries, fig.width=11, fig.height=9}
+decision_boundary_plots <- imap(
+  model_fits,
+  ~ plot_decision_boundary(.x, train_data, test_data, .y)
+)
+
+# Display the four plots together.
+# If patchwork is not installed, run install.packages("patchwork") or print each plot one at a time.
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  library(patchwork)
+  wrap_plots(decision_boundary_plots, ncol = 2)
+} else {
+  walk(decision_boundary_plots, print)
+}
+```
+
+## Question 5
+
+Compare the decision boundaries.
+
+- Which models produce straight decision boundaries?
+- Which models produce curved decision boundaries?
+- Which model seems most appropriate for this dataset?
+
+# Kernel Exploration
+
+Now experiment with SVM settings.
+
+Try changing:
+
+- `cost`
+- `degree` for the polynomial kernel
+- `rbf_sigma` for the RBF kernel
+
+## Question 6
+
+Choose one SVM kernel and change one parameter. What changed in the decision boundary?
+
+**Hint:** Smaller `cost` usually allows a wider margin with more tolerance for mistakes. Larger `cost` tries harder to classify the training data correctly. For RBF kernels, larger `rbf_sigma` can create more local, flexible decision boundaries.
+
+```{r kernel-experiment, fig.width=7, fig.height=5}
+# TODO: modify one SVM model below and visualize its decision boundary
+
+experiment_spec <- svm_ #TODO
+
+experiment_fit <- workflow() %>%
+  add_recipe(penguin_recipe) %>%
+  add_model(experiment_spec) %>%
+  fit(data = train_data)
+
+plot_decision_boundary(
+  experiment_fit,
+  train_data,
+  test_data,
+  "Experimental SVM"
+)
+```
+
+```{r experiment-accuracy}
+experiment_predictions <- predict(experiment_fit, test_data, type = "class") %>%
+  bind_cols(test_data %>% select(species))
+
+experiment_predictions %>%
+  accuracy(truth = species, estimate = .pred_class)
+```
+
+# Reflection
+
+Answer the following questions in a few sentences each.
+
+1. Why do we scale predictors before fitting an SVM?
+2. How is logistic regression different from a linear SVM?
+3. What does the kernel do in an SVM?
+4. Why might a highly flexible kernel overfit?
+5. In environmental science, when might a nonlinear decision boundary be useful?
