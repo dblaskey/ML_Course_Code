@@ -1,0 +1,503 @@
+---
+title: "Homework: Data Leakage, Cross-Validation, and Tree-Based Models"
+author: "GEOL 599 Machine Learning"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# If needed, install packages:
+# install.packages(c("tidyverse", "tidymodels", "ranger", "xgboost"))
+
+library(tidyverse)
+library(tidymodels)
+library(ranger)
+library(xgboost)
+
+tidymodels_prefer()
+theme_set(theme_minimal(base_size = 12))
+
+set.seed(7)
+```
+
+## Overview
+
+In this homework, you will use the **Forest CoverType** dataset to predict forest cover type from topographic, hydrologic, soil, and wilderness-area variables.
+
+The goals are to:
+
+1. Identify and explain **data leakage**.
+2. Compare a leaky model to a properly validated model.
+3. Use cross-validation to tune either a **random forest** or an **XGBoost** model.
+4. Fit a final model and evaluate it on a held-out test set.
+5. Explain the model workflow clearly enough that someone else could trust the results.
+
+The dataset comes from the UCI Machine Learning Repository and contains observations from forested areas in Colorado.
+
+## 1. Load The Data
+
+```{r load-data, message=FALSE}
+cover_url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/covtype/covtype.data.gz"
+
+cover_names <- c(
+  "elevation",
+  "aspect",
+  "slope",
+  "horizontal_distance_to_hydrology",
+  "vertical_distance_to_hydrology",
+  "horizontal_distance_to_roadways",
+  "hillshade_9am",
+  "hillshade_noon",
+  "hillshade_3pm",
+  "horizontal_distance_to_fire_points",
+  paste0("wilderness_area_", 1:4),
+  paste0("soil_type_", 1:40),
+  "cover_type"
+)
+
+cover_raw <- readr::read_csv(
+  cover_url,
+  col_names = cover_names,
+  show_col_types = FALSE
+)
+
+# Use a smaller sample so the assignment runs quickly on laptops.
+cover_data <- cover_raw %>%
+  mutate(
+    cover_type = factor(
+      cover_type,
+      levels = 1:7,
+      labels = c(
+        "Spruce/Fir",
+        "Lodgepole Pine",
+        "Ponderosa Pine",
+        "Cottonwood/Willow",
+        "Aspen",
+        "Douglas-fir",
+        "Krummholz"
+      )
+    )
+  ) %>%
+  slice_sample(n = 15000)
+
+glimpse(cover_data)
+```
+
+## 2. Explore The Response Variable
+
+```{r class-balance}
+cover_data %>%
+  count(cover_type, sort = TRUE) %>%
+  mutate(percent = n / sum(n))
+```
+
+**Question 1.** Is this a balanced classification problem? Which classes are most common, and which are least common?
+
+Write your answer here:
+
+>
+
+## 3. What Is Data Leakage?
+
+Data leakage happens when information reaches the model during training that would **not be available at prediction time**.
+
+Examples include:
+
+- A predictor created directly from the response variable.
+- Preprocessing the full dataset before splitting into training and test sets.
+- Using future information to predict the past.
+- Allowing duplicate or near-duplicate observations to appear in both training and test data.
+- Computing group, spatial, or temporal summaries using the full dataset before validation.
+
+In this assignment, we will create an intentionally leaky variable so you can see how leakage can make a model look unrealistically good.
+
+## 4. Create A Leaky Dataset
+
+The variable below is not a real environmental predictor. It is created from the answer we are trying to predict.
+
+```{r create-leak}
+leaky_data <- cover_data %>%
+  mutate(
+    leaky_cover_code = as.integer(cover_type)
+  )
+```
+
+**Question 2.** Why is `leaky_cover_code` an example of data leakage?
+
+Write your answer here:
+
+>
+
+## 5. Split The Leaky Dataset
+
+```{r split-leaky}
+set.seed(7)
+
+leaky_split <- initial_split(
+  leaky_data,
+  prop = 0.75,
+  strata = cover_type
+)
+
+leaky_train <- training(leaky_split)
+leaky_test <- testing(leaky_split)
+```
+
+## 6. Fit A Leaky Model
+
+This model is allowed to use the leaky predictor. Its performance should look suspiciously strong.
+
+```{r leaky-model}
+leaky_recipe <- recipe(cover_type ~ ., data = leaky_train)
+
+leaky_model <- rand_forest(
+  trees = 200,
+  mtry = 8,
+  min_n = 5
+) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "impurity")
+
+leaky_workflow <- workflow() %>%
+  add_recipe(leaky_recipe) %>%
+  add_model(leaky_model)
+
+leaky_fit <- fit(leaky_workflow, data = leaky_train)
+
+leaky_predictions <- predict(leaky_fit, leaky_test) %>%
+  bind_cols(predict(leaky_fit, leaky_test, type = "prob")) %>%
+  bind_cols(leaky_test %>% select(cover_type))
+
+leaky_metrics <- metric_set(accuracy, kap, f_meas)
+
+leaky_metrics(
+  leaky_predictions,
+  truth = cover_type,
+  estimate = .pred_class
+)
+```
+
+**Question 3.** Why should you distrust the leaky model, even if the accuracy is very high?
+
+Write your answer here:
+
+>
+
+## 7. Build The Proper Dataset
+
+Now remove the leaky variable and restart the modeling process correctly.
+
+```{r proper-data}
+model_data <- cover_data %>%
+  select(-matches("^leaky_"))
+
+set.seed(7)
+
+cover_split <- initial_split(
+  model_data,
+  prop = 0.75,
+  strata = cover_type
+)
+
+cover_train <- training(cover_split)
+cover_test <- testing(cover_split)
+```
+
+**Question 4.** Why do we split the data before cross-validation, tuning, or final model evaluation?
+
+Write your answer here:
+
+>
+
+## 8. Cross-Validation Folds
+
+Cross-validation should be created from the **training data only**.
+
+```{r cv-folds}
+set.seed(7)
+
+cover_folds <- vfold_cv(
+  cover_train,
+  v = 5,
+  strata = cover_type
+)
+
+cover_folds
+```
+
+## 9. Choose Your Model
+
+Choose **one** model:
+
+- `"random_forest"`
+- `"xgboost"`
+
+**Question 5.** Which model did you choose, and why? Your reason can be based on interpretability, speed, expected performance, or what you want to practice.
+
+Write your answer here:
+
+>
+
+## 10. Create The Recipe
+
+The predictors are already numeric, including the wilderness-area and soil-type indicator variables. We will still include a median imputation step as a best practice.
+
+```{r recipe}
+cover_recipe <- recipe(cover_type ~ ., data = cover_train) %>%
+  step_impute_median(all_numeric_predictors())
+
+cover_recipe
+```
+
+## 11. Define Candidate Models
+
+```{r model-specs}
+rf_spec <- rand_forest(
+  trees = tune(),
+  mtry = tune(),
+  min_n = tune()
+) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "impurity")
+
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune(),
+  min_n = tune()
+) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost", eval_metric = "mlogloss")
+```
+
+## 12. Create The Workflow
+
+```{r workflow}
+
+cover_workflow <- workflow() %>%
+  add_recipe(cover_recipe) %>%
+  add_model(#TODO)
+
+cover_workflow
+```
+
+## 13. Create A Small Tuning Grid
+
+For homework, use a modest grid so the code finishes in a reasonable amount of time. You may expand the grid if your computer can handle it.
+
+```{r tuning-grid}
+tune_grid_values <- grid_regular(#TODO)
+
+tune_grid_values
+```
+
+## 14. Tune With Cross-Validation
+
+```{r tune-model, message=FALSE, warning=FALSE}
+classification_metrics <- metric_set(accuracy, kap, f_meas)
+
+set.seed(7)
+
+cv_results <- tune_grid(
+  cover_workflow,
+  resamples = cover_folds,
+  grid = tune_grid_values,
+  metrics = classification_metrics,
+  control = control_grid(save_pred = TRUE)
+)
+
+collect_metrics(cv_results)
+```
+
+**Question 6.** Which metric do you think is most useful for this dataset: accuracy, kappa, or F-measure? Explain your choice.
+
+Write your answer here:
+
+>
+
+## 15. Select The Best Model
+
+```{r select-best}
+best_params <- select_best(cv_results, metric = "f_meas")
+
+best_params
+```
+
+```{r finalize-workflow}
+final_workflow <- finalize_workflow(
+  cover_workflow,
+  best_params
+)
+
+final_workflow
+```
+
+**Question 7.** What hyperparameters were selected for your model? Do the selected values suggest a simple model or a more flexible model?
+
+Write your answer here:
+
+>
+
+## 16. Final Test Evaluation
+
+Only use the test set once, after model selection is complete.
+
+```{r final-fit, message=FALSE, warning=FALSE}
+final_fit <- last_fit(
+  final_workflow,
+  split = cover_split,
+  metrics = classification_metrics
+)
+
+collect_metrics(final_fit)
+```
+
+```{r final-confusion}
+final_predictions <- collect_predictions(final_fit)
+
+final_predictions %>%
+  conf_mat(truth = cover_type, estimate = .pred_class)
+```
+
+```{r confusion-plot}
+confusion_plot_data <- final_predictions %>%
+  count(cover_type, .pred_class, name = "n") %>%
+  complete(cover_type, .pred_class, fill = list(n = 0))
+
+ggplot(confusion_plot_data, aes(x = .pred_class, y = cover_type, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = n), size = 3) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  scale_x_discrete(limits = rev) +
+  labs(
+    title = "Final test-set confusion matrix",
+    x = "Predicted cover type",
+    y = "Observed cover type",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Question 8.** Which classes does the model predict well? Which classes are most often confused?
+
+Write your answer here:
+
+>
+
+## 17. Compare Leaky And Proper Results
+
+```{r compare-results}
+proper_test_metrics <- collect_metrics(final_fit) %>%
+  mutate(workflow = "Proper workflow")
+
+leaky_test_metrics <- leaky_metrics(
+  leaky_predictions,
+  truth = cover_type,
+  estimate = .pred_class
+) %>%
+  mutate(workflow = "Leaky workflow")
+
+bind_rows(leaky_test_metrics, proper_test_metrics) %>%
+  select(workflow, .metric, .estimate)
+```
+
+**Question 9.** Compare the leaky model results to the proper final model results. What does this comparison teach you about data leakage?
+
+Write your answer here:
+
+>
+
+## 18. Simple Permutation Importance
+
+This section gives a model-agnostic way to ask: how much worse does the model get if one predictor is randomly shuffled?
+
+```{r permutation-importance, message=FALSE, warning=FALSE}
+final_trained_workflow <- fit(final_workflow, data = cover_train)
+
+baseline_predictions <- predict(final_trained_workflow, cover_test) %>%
+  bind_cols(cover_test %>% select(cover_type))
+
+baseline_f <- f_meas(
+  baseline_predictions,
+  truth = cover_type,
+  estimate = .pred_class
+) %>%
+  pull(.estimate)
+
+set.seed(7)
+
+importance_variables <- c(
+  "elevation",
+  "slope",
+  "horizontal_distance_to_hydrology",
+  "horizontal_distance_to_roadways",
+  "horizontal_distance_to_fire_points"
+)
+
+permutation_importance <- map_dfr(importance_variables, function(var_name) {
+  permuted_test <- cover_test
+  permuted_test[[var_name]] <- sample(permuted_test[[var_name]])
+
+  permuted_predictions <- predict(final_trained_workflow, permuted_test) %>%
+    bind_cols(cover_test %>% select(cover_type))
+
+  permuted_f <- f_meas(
+    permuted_predictions,
+    truth = cover_type,
+    estimate = .pred_class
+  ) %>%
+    pull(.estimate)
+
+  tibble(
+    variable = var_name,
+    baseline_f_meas = baseline_f,
+    permuted_f_meas = permuted_f,
+    importance = baseline_f - permuted_f
+  )
+})
+
+permutation_importance %>%
+  arrange(desc(importance))
+```
+
+```{r permutation-importance-plot}
+permutation_importance %>%
+  mutate(variable = fct_reorder(variable, importance)) %>%
+  ggplot(aes(x = importance, y = variable)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Simple permutation importance",
+    x = "Drop in F-measure after shuffling",
+    y = NULL
+  )
+```
+
+**Question 10.** Which variables appear most important in your model? Does that make environmental sense?
+
+Write your answer here:
+
+>
+
+## 19. Final Reflection
+
+Answer the following in a short paragraph.
+
+**Question 11.** Describe your complete modeling workflow. Your answer should mention:
+
+- How you avoided data leakage.
+- Why you used cross-validation.
+- Which model you chose.
+- Which metric you used to select the model.
+- How the final test performance compared to the leaky model.
+- One limitation of this modeling approach.
+
+Write your answer here:
+
+>
+
