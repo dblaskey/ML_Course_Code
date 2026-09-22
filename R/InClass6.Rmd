@@ -1,0 +1,765 @@
+---
+title: "In-Class Activity 6: Decision Trees, Random Forests, and Boosting"
+author: "GEOL 599: Machine Learning"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# If needed, install these packages first:
+# install.packages(c("tidyverse", "tidymodels", "rpart", "rpart.plot", "ranger", "xgboost", "patchwork"))
+
+library(tidyverse)
+library(tidymodels)
+library(rpart)
+library(rpart.plot)
+library(ranger)
+library(xgboost)
+library(patchwork)
+
+tidymodels_prefer()
+set.seed(42)
+```
+
+# Overview
+
+In this activity, you will use the **Statlog Landsat Satellite** dataset to compare several tree-based machine-learning models:
+
+- A single decision tree
+- Random forest
+- XGBoost
+
+Each row represents a small 3 by 3 pixel neighborhood from Landsat satellite imagery. The predictors are spectral measurements from those pixels, and the target is the land-cover class of the central pixel.
+
+## Learning Goals
+
+By the end of this activity, you should be able to:
+
+- Explain why decision trees make **axis-aligned splits**.
+- Visualize the limitations of a single decision tree boundary.
+- Compare a single tree with ensemble tree methods.
+- Explain the difference between bagging and boosting.
+- Use train/test splits and cross-validation appropriately.
+- Tune tree-based models without leaking information from the test set.
+- Interpret model behavior using feature importance and permutation importance.
+
+# 1. Load the Landsat Dataset
+
+The dataset is the Statlog Landsat Satellite dataset from OpenML/UCI. Each row contains 36 spectral measurements:
+
+```text
+9 pixels x 4 spectral bands = 36 predictors
+```
+
+The four spectral values for the central pixel are attributes 17, 18, 19, and 20. With the naming scheme below, those are:
+
+```text
+pixel_5_band_1
+pixel_5_band_2
+pixel_5_band_3
+pixel_5_band_4
+```
+
+```{r load-data}
+data_url <- "https://raw.githubusercontent.com/dblaskey/ML_Course_Code/main/Data/Landsat_Landcover.csv"
+
+landsat_raw <- read_csv(data_url, show_col_types = FALSE)
+
+glimpse(landsat_raw)
+```
+
+```{r clean-data}
+feature_cols <- paste0(
+  "pixel_",
+  rep(1:9, each = 4),
+  "_band_",
+  rep(1:4, times = 9)
+)
+
+# The target is the last column in this CSV.
+target_col <- names(landsat_raw)[ncol(landsat_raw)]
+
+landsat <- landsat_raw %>%
+  rename_with(~ feature_cols, .cols = 1:36) %>%
+  rename(land_cover_code = all_of(target_col)) %>%
+  mutate(
+    land_cover_raw = as.character(land_cover_code),
+    land_cover_clean = land_cover_raw %>%
+      str_to_lower() %>%
+      str_replace_all("[._-]+", " ") %>%
+      str_squish(),
+    land_cover_number = readr::parse_number(land_cover_raw),
+    land_cover = case_when(
+      land_cover_number == 1~ "red_soil",
+      land_cover_number == 2 ~ "cotton_crop",
+      land_cover_number == 3 ~ "grey_soil",
+      land_cover_number == 4 ~ "damp_grey_soil",
+      land_cover_number == 5 ~ "soil_with_vegetation_stubble",
+      land_cover_number == 7 ~ "very_damp_grey_soil",
+      TRUE ~ NA_character_
+    ),
+    land_cover = factor(land_cover)
+  ) %>%
+  filter(!is.na(land_cover)) %>%
+  select(all_of(feature_cols), land_cover)
+
+landsat %>% slice_head(n = 6)
+```
+
+# 2. Initial Data Checks
+
+Before modeling, check the number of rows, columns, missing values, and class balance.
+
+```{r data-checks}
+cat("Rows and columns:\n")
+dim(landsat)
+
+cat("\nMissing values:\n")
+sum(is.na(landsat))
+
+class_counts <- landsat %>%
+  count(land_cover, sort = TRUE)
+
+class_counts
+```
+
+```{r class-count-plot, fig.width=8, fig.height=4}
+ggplot(class_counts, aes(x = reorder(land_cover, n), y = n)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Landsat land-cover class counts",
+    x = "Land-cover class",
+    y = "Number of observations"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Question 1
+
+Is this classification problem balanced? Which land-cover classes are most and least common?
+
+# 3. Why Decision Trees Have Axis-Aligned Splits
+
+Decision trees split one feature at a time.
+
+Examples:
+
+```text
+pixel_5_band_1 <= 66
+pixel_5_band_2 <= 42
+pixel_5_band_4 <= 87
+```
+
+That means a decision tree creates boundaries that are vertical or horizontal in a two-feature plot. These are called **axis-aligned splits**.
+
+This is powerful and interpretable, but it can be inefficient when the real class boundary is diagonal, curved, or depends on a smooth combination of predictors.
+
+# 4. Build a Two-Feature Dataset for Visualization
+
+To visualize decision boundaries, we will use only two predictors from the central pixel:
+
+- `pixel_5_band_1`
+- `pixel_5_band_2`
+
+This is intentionally limited. Later, we will use all 36 spectral predictors.
+
+```{r two-feature-data}
+two_feature_cols <- c("pixel_5_band_1", "pixel_5_band_2")
+
+landsat_two <- landsat %>%
+  select(all_of(two_feature_cols), land_cover) %>%
+  drop_na()
+
+set.seed(42)
+two_split <- initial_split(landsat_two, prop = 0.75, strata = land_cover)
+two_train <- training(two_split)
+two_test <- testing(two_split)
+
+class_levels <- levels(landsat_two$land_cover)
+class_palette <- setNames(scales::hue_pal()(length(class_levels)), class_levels)
+
+class_palette
+```
+
+```{r two-feature-plot, fig.width=8, fig.height=6}
+ggplot(landsat_two, aes(x = pixel_5_band_1, y = pixel_5_band_2, color = land_cover)) +
+  geom_point(alpha = 0.65, size = 1.6) +
+  scale_color_manual(values = class_palette) +
+  labs(
+    title = "Landsat classes using two central-pixel spectral bands",
+    x = "pixel_5_band_1",
+    y = "pixel_5_band_2",
+    color = "Land cover"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Question 2
+
+Looking at the scatterplot, where might a single decision tree struggle? Do the classes appear separable by only horizontal and vertical cuts?
+
+# 5. Fit a Shallow Decision Tree
+
+A shallow tree is easy to interpret, but it may be too simple.
+
+```{r shallow-tree}
+shallow_tree <- rpart(
+  land_cover ~ pixel_5_band_1 + pixel_5_band_2,
+  data = two_train,
+  method = "class",
+  control = rpart.control(maxdepth = 2, cp = 0.001)
+)
+
+shallow_tree_pred_train <- predict(shallow_tree, newdata = two_train, type = "class")
+shallow_tree_pred_test <- predict(shallow_tree, newdata = two_test, type = "class")
+
+mean(shallow_tree_pred_train == two_train$land_cover)
+mean(shallow_tree_pred_test == two_test$land_cover)
+```
+
+```{r plot-shallow-tree, fig.width=14, fig.height=7}
+rpart.plot(
+  shallow_tree,
+  type = 2,
+  extra = 104,
+  fallen.leaves = TRUE,
+  main = "Shallow decision tree"
+)
+```
+
+# 6. Decision Boundary Helper Function
+
+The background color shows the model's predicted class across the two-feature space. The points show the observed classes. Training observations are circles and test observations are X symbols.
+
+```{r decision-boundary-function}
+predict_tree_classes <- function(model, new_data) {
+  predict(model, newdata = new_data, type = "class")
+}
+
+
+plot_decision_boundary <- function(model, train_data, test_data, title, predict_fun = predict_tree_classes) {
+  x_min <- min(train_data$pixel_5_band_1, test_data$pixel_5_band_1) - 5
+  x_max <- max(train_data$pixel_5_band_1, test_data$pixel_5_band_1) + 5
+  y_min <- min(train_data$pixel_5_band_2, test_data$pixel_5_band_2) - 5
+  y_max <- max(train_data$pixel_5_band_2, test_data$pixel_5_band_2) + 5
+
+  prediction_grid <- expand_grid(
+    pixel_5_band_1 = seq(x_min, x_max, length.out = 300),
+    pixel_5_band_2 = seq(y_min, y_max, length.out = 300)
+  )
+
+  grid_predictions <- prediction_grid %>%
+    mutate(.pred_class = predict_fun(model, prediction_grid))
+
+  point_data <- bind_rows(
+    train_data %>% mutate(split = "Training"),
+    test_data %>% mutate(split = "Test")
+  )
+
+  ggplot() +
+    geom_raster(
+      data = grid_predictions,
+      aes(x = pixel_5_band_1, y = pixel_5_band_2, fill = .pred_class),
+      alpha = 0.25
+    ) +
+    geom_point(
+      data = point_data,
+      aes(x = pixel_5_band_1, y = pixel_5_band_2, color = land_cover, shape = split),
+      size = 1.8,
+      alpha = 0.8
+    ) +
+    scale_fill_manual(values = class_palette, drop = FALSE) +
+    scale_color_manual(values = class_palette, drop = FALSE) +
+    scale_shape_manual(values = c("Training" = 16, "Test" = 4)) +
+    coord_cartesian(xlim = c(-2.5, 2.5), ylim = c(-2.5, 2.5)) +
+    labs(
+      title = title,
+      x = "pixel_5_band_1",
+      y = "pixel_5_band_2",
+      fill = "Predicted class",
+      color = "Observed class",
+      shape = "Dataset split"
+    ) +
+    theme_minimal(base_size = 12)
+}
+```
+
+```{r shallow-tree-boundary, fig.width=8, fig.height=6}
+plot_decision_boundary(
+  shallow_tree,
+  two_train,
+  two_test,
+  "Shallow decision tree: axis-aligned splits"
+)
+```
+
+## Question 3
+
+What do you notice about the decision boundary? Why does it look like rectangles or stair steps?
+
+# 7. Compare Single Tree Depths
+
+Deeper trees are more flexible, but they can overfit.
+
+```{r tree-depths, fig.width=12, fig.height=10}
+tree_depths <- c(1, 2, 5, 30)
+
+tree_depth_plots <- map(
+  tree_depths,
+  function(depth) {
+    tree_fit <- rpart(
+      land_cover ~ pixel_5_band_1 + pixel_5_band_2,
+      data = two_train,
+      method = "class",
+      control = rpart.control(maxdepth = depth, cp = 0.001)
+    )
+
+    plot_decision_boundary(
+      tree_fit,
+      two_train,
+      two_test,
+      paste0("Decision tree maxdepth = ", depth)
+    )
+  }
+)
+
+wrap_plots(tree_depth_plots, ncol = 2)
+```
+
+## Question 4
+
+How does the decision boundary change as the tree gets deeper? Which model seems most likely to overfit?
+
+# 8. Compare Tree-Based Ensembles on the Same Two Features
+
+Now compare:
+
+- Decision tree
+- Random forest
+- XGBoost
+
+This section is still using only two features so the boundaries can be visualized.
+
+```{r two-feature-models}
+# Decision tree
+boundary_tree <- rpart(
+  land_cover ~ pixel_5_band_1 + pixel_5_band_2,
+  data = two_train,
+  method = "class",
+  control = rpart.control(maxdepth = 5, cp = 0.001)
+)
+
+# Random forest
+boundary_rf <- ranger(
+  land_cover ~ pixel_5_band_1 + pixel_5_band_2,
+  data = two_train,
+  num.trees = 200,
+  max.depth = 6,
+  probability = FALSE,
+  seed = 42
+)
+
+
+# XGBoost through tidymodels
+boundary_xgb_spec <- boost_tree(
+  trees = 100,
+  tree_depth = 2,
+  learn_rate = 0.1,
+  sample_size = 0.9,
+  mtry = 2
+) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost", eval_metric = "mlogloss")
+
+boundary_xgb_wf <- workflow() %>%
+  add_formula(land_cover ~ pixel_5_band_1 + pixel_5_band_2) %>%
+  add_model(boundary_xgb_spec)
+
+boundary_xgb <- fit(boundary_xgb_wf, data = two_train)
+```
+
+```{r two-feature-accuracy}
+predict_ranger_classes <- function(model, new_data) {
+  predict(model, data = new_data)$predictions %>%
+    factor(levels = class_levels)
+}
+
+predict_workflow_classes <- function(model, new_data) {
+  predict(model, new_data, type = "class")$.pred_class %>%
+    factor(levels = class_levels)
+}
+
+two_feature_accuracy <- tibble(
+  model = c("Decision tree", "Random forest", "XGBoost"),
+  train_accuracy = c(
+    mean(predict_tree_classes(boundary_tree, two_train) == two_train$land_cover),
+    mean(predict_ranger_classes(boundary_rf, two_train) == two_train$land_cover),
+    mean(predict_workflow_classes(boundary_xgb, two_train) == two_train$land_cover)
+  ),
+  test_accuracy = c(
+    mean(predict_tree_classes(boundary_tree, two_test) == two_test$land_cover),
+    mean(predict_ranger_classes(boundary_rf, two_test) == two_test$land_cover),
+    mean(predict_workflow_classes(boundary_xgb, two_test) == two_test$land_cover)
+  )
+)
+
+two_feature_accuracy
+```
+
+```{r two-feature-boundaries, fig.width=14, fig.height=11}
+p1 <- plot_decision_boundary(boundary_tree, two_train, two_test, "Decision tree")
+p2 <- plot_decision_boundary(boundary_rf, two_train, two_test, "Random forest", predict_fun = predict_ranger_classes)
+p3 <- plot_decision_boundary(boundary_xgb, two_train, two_test, "XGBoost", predict_fun = predict_workflow_classes)
+
+p1 / p2 / p3
+```
+
+## Question 5
+
+Compare the three decision boundaries.
+
+1. Which model has the simplest boundary?
+2. Which model has the most complex boundary?
+3. Which model seems most likely to overfit?
+4. Why do all tree-based boundaries still look somewhat blocky?
+
+# Part 2: Best Practices With All Spectral Features
+
+The two-feature plots are useful for learning, but they are not the best possible models. In real modeling, we should use a proper train/test split, cross-validation, preprocessing, and tuning.
+
+We will now use all 36 spectral predictors.
+
+Best-practice reminders:
+
+- Keep the test set untouched until final evaluation.
+- Use cross-validation for model comparison and tuning.
+- Use workflows or consistent preprocessing to avoid leakage.
+- Tune complexity controls such as tree depth, number of trees, and learning rate.
+- Compare against a simple baseline.
+
+# 9. Prepare the Full Feature Dataset
+
+```{r full-feature-data}
+set.seed(42)
+landsat_split <- initial_split(landsat, prop = 0.75, strata = land_cover)
+train_data <- training(landsat_split)
+test_data <- testing(landsat_split)
+
+nrow(train_data)
+nrow(test_data)
+ncol(train_data) - 1
+```
+
+# 10. Define Baseline and Candidate Models
+
+Tree models do not require feature scaling. We include a median imputer in the recipe as a best-practice safeguard, although this dataset should not have missing predictor values.
+
+```{r model-workflows}
+landsat_recipe <- recipe(land_cover ~ ., data = train_data) %>%
+  step_impute_median(all_numeric_predictors())
+
+baseline_spec <- null_model() %>%
+  set_mode("classification") %>%
+  set_engine("parsnip")
+
+tree_spec <- decision_tree(
+  tree_depth = 8,
+  min_n = 5,
+  cost_complexity = 0.001
+) %>%
+  set_mode("classification") %>%
+  set_engine("rpart")
+
+rf_spec <- rand_forest(
+  trees = 300,
+  mtry = 6,
+  min_n = 2
+) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+xgb_spec <- boost_tree(
+  trees = 150,
+  tree_depth = 2,
+  learn_rate = 0.05,
+  sample_size = 0.9,
+  mtry = 24
+) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost", eval_metric = "mlogloss")
+
+make_workflow <- function(model_spec) {
+  workflow() %>%
+    add_recipe(landsat_recipe) %>%
+    add_model(model_spec)
+}
+
+candidate_workflows <- list(
+  "Baseline" = make_workflow(baseline_spec),
+  "Decision tree" = make_workflow(tree_spec),
+  "Random forest" = make_workflow(rf_spec),
+  "XGBoost" = make_workflow(xgb_spec)
+)
+```
+
+# 11. Cross-Validation Comparison
+
+Use cross-validation on the training set to compare models before touching the test set.
+
+```{r cross-validation}
+set.seed(42)
+cv_folds <- vfold_cv(train_data, v = 5, strata = land_cover)
+
+classification_metrics <- metric_set(accuracy, f_meas)
+
+cv_results <- imap_dfr(
+  candidate_workflows,
+  function(wf, model_name) {
+    fit_resamples(
+      wf,
+      resamples = cv_folds,
+      metrics = classification_metrics,
+      control = control_resamples(save_pred = TRUE)
+    ) %>%
+      collect_metrics() %>%
+      mutate(model = model_name)
+  }
+)
+
+cv_results
+```
+
+```{r cv-summary}
+cv_summary <- cv_results %>%
+  select(model, .metric, mean, std_err) %>%
+  arrange(.metric, desc(mean))
+
+cv_summary
+```
+
+## Question 6
+
+Which model has the best cross-validated macro F1 score? Does any model have much higher training accuracy than validation accuracy? What would that suggest?
+
+# 12. Tune XGBoost
+
+XGBoost has many tuning parameters. We will tune only a few so the activity stays manageable.
+
+Important parameters:
+
+- `tree_depth`: tree complexity
+- `learn_rate`: contribution of each tree
+- `trees`: number of boosting rounds
+- `sample_size`: fraction of rows used per tree
+- `mtry`: number of predictors sampled at each split
+
+Best practice: tune on the training set using cross-validation, then evaluate once on the held-out test set.
+
+```{r tune-xgboost}
+xgb_tune_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  sample_size = tune(),
+  mtry = tune(),
+  min_n = 2
+) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost", eval_metric = "mlogloss")
+
+xgb_tune_wf <- workflow() %>%
+  add_recipe(landsat_recipe) %>%
+  add_model(xgb_tune_spec)
+
+xgb_grid <- crossing(
+  trees = c(150, 300),
+  tree_depth = c(2, 4),
+  learn_rate = c(0.03, 0.1),
+  sample_size = c(0.8, 1.0),
+  mtry = c(12, 24)
+)
+
+set.seed(42)
+xgb_tuned <- tune_grid(
+  xgb_tune_wf,
+  resamples = cv_folds,
+  grid = xgb_grid,
+  metrics = classification_metrics,
+  control = control_grid(save_pred = TRUE)
+)
+
+show_best(xgb_tuned, metric = "f_meas")
+```
+
+```{r select-best-xgboost}
+best_xgb <- select_best(xgb_tuned, metric = "f_meas")
+best_xgb
+
+final_xgb_wf <- finalize_workflow(xgb_tune_wf, best_xgb)
+```
+
+## Question 7
+
+Which parameters were selected for XGBoost? Were the selected trees shallow or deep? What does `sample_size` do?
+
+# 13. Final Test-Set Evaluation
+
+Now evaluate the selected models on the test set.
+
+The test set should be used only after model comparison and tuning decisions are complete.
+
+```{r final-test-evaluation}
+final_workflows <- list(
+  "Decision tree" = candidate_workflows[["Decision tree"]],
+  "Random forest" = candidate_workflows[["Random forest"]],
+  "Tuned XGBoost" = final_xgb_wf
+)
+
+final_predictions <- imap_dfr(
+  final_workflows,
+  function(wf, model_name) {
+    fit(wf, data = train_data) %>%
+      predict(test_data, type = "class") %>%
+      bind_cols(test_data %>% select(land_cover)) %>%
+      mutate(model = model_name)
+  }
+)
+
+final_predictions %>%
+  group_by(model) %>%
+  accuracy(truth = land_cover, estimate = .pred_class)
+```
+
+```{r final-f1}
+final_predictions %>%
+  group_by(model) %>%
+  f_meas(truth = land_cover, estimate = .pred_class)
+```
+
+```{r confusion-matrices, fig.width=12, fig.height=10}
+confusion_plot_data <- final_predictions %>%
+  count(model, land_cover, .pred_class, name = "n") %>%
+  complete(model, land_cover, .pred_class, fill = list(n = 0))
+
+ggplot(confusion_plot_data, aes(x = .pred_class, y = land_cover, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = n), size = 3) +
+  facet_wrap(~ model) +
+  scale_x_discrete(limits = rev) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(
+    title = "Confusion matrices for final test set",
+    x = "Predicted class",
+    y = "Observed class",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Question 8
+
+Which model performs best on the test set? Is that the same model that performed best during cross-validation? If not, why might that happen?
+
+# 14. Feature Importance and Permutation Importance
+
+Tree-based models often provide built-in feature importance, but those values can be biased. Permutation importance is usually easier to explain:
+
+> A feature is important if model performance gets worse when that feature is randomly shuffled.
+
+Here we will use permutation importance on the tuned XGBoost model.
+
+```{r permutation-importance}
+final_xgb_fit <- fit(final_xgb_wf, data = train_data)
+
+baseline_predictions <- predict(final_xgb_fit, test_data, type = "class") %>%
+  bind_cols(test_data %>% select(land_cover))
+
+baseline_f1 <- f_meas(
+  baseline_predictions,
+  truth = land_cover,
+  estimate = .pred_class
+) %>%
+  pull(.estimate)
+
+set.seed(42)
+permute_one_feature <- function(feature_name, repeats = 10) {
+  map_dfr(seq_len(repeats), function(rep_id) {
+    permuted_test <- test_data
+    permuted_test[[feature_name]] <- sample(permuted_test[[feature_name]])
+
+    permuted_predictions <- predict(final_xgb_fit, permuted_test, type = "class") %>%
+      bind_cols(test_data %>% select(land_cover))
+
+    permuted_f1 <- f_meas(
+      permuted_predictions,
+      truth = land_cover,
+      estimate = .pred_class
+    ) %>%
+      pull(.estimate)
+
+    tibble(
+      feature = feature_name,
+      repeat_id = rep_id,
+      importance = baseline_f1 - permuted_f1
+    )
+  })
+}
+
+importance_df <- map_dfr(feature_cols, permute_one_feature) %>%
+  group_by(feature) %>%
+  summarize(
+    importance_mean = mean(importance),
+    importance_sd = sd(importance),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(importance_mean))
+
+importance_df %>% slice_head(n = 12)
+```
+
+```{r permutation-importance-plot, fig.width=8, fig.height=6}
+importance_df %>%
+  slice_max(importance_mean, n = 12) %>%
+  ggplot(aes(x = reorder(feature, importance_mean), y = importance_mean)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Permutation importance: tuned XGBoost",
+    x = "Feature",
+    y = "Decrease in macro F1 after permutation"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Question 9
+
+Which spectral features appear most important? Do the central-pixel bands appear useful? Why might neighboring-pixel spectral values also help classify land cover?
+
+Be careful: feature importance describes what the model used. It does not prove causation.
+
+# 15. Best-Practice Reflection
+
+Answer these questions in a few sentences each.
+
+1. Why is a single decision tree easy to interpret but prone to overfitting?
+2. Why do decision tree boundaries look blocky in two dimensions?
+3. How is a random forest different from a single tree?
+4. How is boosting different from random forest bagging?
+5. Why should XGBoost be tuned with cross-validation instead of directly on the test set?
+6. Why is permutation importance useful, and what are its limitations?
+7. For environmental remote-sensing datasets, why might random train/test splits still be too optimistic?
+
+# Key Takeaways
+
+- A decision tree makes one-feature-at-a-time splits, creating axis-aligned boundaries.
+- A shallow tree may underfit; a deep tree may overfit.
+- Random forests average many trees to reduce variance.
+- XGBoost builds trees sequentially so later trees correct earlier mistakes.
+- XGBoost is powerful, but tuning and validation matter.
+- Workflows help prevent preprocessing leakage.
+- Feature importance helps explain model behavior, but importance is not causality.
+- In environmental science, spatial and temporal validation may matter more than small differences among algorithms.
