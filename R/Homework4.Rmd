@@ -369,9 +369,10 @@ Use cross-validated residuals from the random CV model to estimate the spatial s
 
 1. Fit the workflow once to the full modeling table.
 2. Predict SST for the same rows.
-3. Compute residuals.
-4. Convert one time step, or a sample of residuals, into an `sf`/`sp` object.
-5. Use `gstat::variogram()`.
+3. Convert to overall average observed and modeled sst for each location.
+4. Compute residuals.
+5. Convert into an `sf`/`sp` object.
+6. Use `gstat::variogram()`.
 
 ```{r residual-variogram, fig.width=7, fig.height=5}
 # TODO: Create a variogram of model residuals to estimate spatial autocorrelation distance. 
