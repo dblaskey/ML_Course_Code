@@ -100,7 +100,7 @@ Complete any LibTorch/Lantern installation prompts, restart RStudio, and then ru
 
 ```{r}
 library(torch)
-library(tidyverse)
+
 x_check <- torch_tensor(
   c(1, 2, 3),
   dtype = torch_float32()
