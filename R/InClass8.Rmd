@@ -1,0 +1,1047 @@
+---
+title: "In-Class Activity: How a CNN Reads Remote-Sensing Data"
+subtitle: "R torch version"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+**Dataset:** Landsat land-cover image patches  
+**Model:** A small convolutional neural network (CNN) using R `torch`  
+**Estimated time:** 75–90 minutes
+
+## Learning goals
+
+By the end of this activity, you should be able to:
+
+1. Explain how a 3 × 3 × 4 remote-sensing patch differs from an ordinary row of tabular data.
+2. Apply a convolutional filter to a spectral band and interpret the resulting feature map.
+3. Describe local connectivity, shared weights, activation functions, epochs, dropout, and early stopping.
+4. Train a small multiclass CNN without leaking validation or test information.
+5. Compare the CNN with multinomial logistic regression.
+6. Interpret learning curves, a confusion matrix, learned filters, and internal feature maps.
+
+## Before class: install R torch
+
+This activity intentionally uses the CPU, so a GPU is not required. 
+
+```{r setup, message=FALSE, warning=FALSE}
+library(torch)
+library(coro)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(tibble)
+library(purrr)
+library(nnet)
+library(knitr)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 5
+)
+
+SEED <- 7L
+
+reset_random_seeds <- function(seed = SEED) {
+  set.seed(seed)
+  torch_manual_seed(seed)
+}
+
+reset_random_seeds()
+
+theme_set(theme_minimal(base_size = 12))
+
+cat("R torch version:", as.character(packageVersion("torch")), "\n")
+cat("Using CPU for a stable classroom workflow.\n")
+```
+
+# Why this dataset can be treated as imagery
+
+Each row contains **36 predictor values**:
+
+$$9\text{ pixels} \times 4\text{ spectral bands}=36\text{ features}.$$
+
+The nine pixels form a 3 × 3 neighborhood. A conventional model receives a flat vector of 36 numbers. A CNN instead receives an array with shape:
+
+$$\text{samples} \times \text{channels} \times \text{height} \times \text{width}.$$
+
+For this activity, that is `N × 4 × 3 × 3`. R `torch` uses **channels first**, matching PyTorch. The CNN therefore knows which values are spatial neighbors. The target is the land-cover class of the center pixel.
+
+The original class numbers are 1, 2, 3, 4, 5, and 7; class 6 does not occur in this dataset.
+
+# Load and inspect the Landsat data
+
+The loader first looks for a local copy and otherwise reads the course GitHub file. Keeping a local copy is recommended for class.
+
+```{r load-data}
+DATA_URL <- "https://raw.githubusercontent.com/dblaskey/ML_Course_Code/main/Data/Landsat_Landcover.csv"
+landsat <- read_csv(DATA_URL, show_col_types = FALSE)
+cat("Shape:", nrow(landsat), "rows ×", ncol(landsat), "columns\n")
+kable(head(landsat))
+```
+
+```{r class-distribution}
+CLASS_NAMES <- c(
+  `1` = "red soil",
+  `2` = "cotton crop",
+  `3` = "grey soil",
+  `4` = "damp grey soil",
+  `5` = "soil with vegetation stubble",
+  `7` = "very damp grey soil"
+)
+
+landsat <- landsat %>%
+  mutate(land_cover = as.integer(land_cover))
+
+class_counts <- landsat %>%
+  count(land_cover, name = "n") %>%
+  arrange(land_cover) %>%
+  mutate(land_cover_name = unname(CLASS_NAMES[as.character(land_cover)]))
+
+kable(class_counts)
+
+ggplot(class_counts, aes(x = land_cover_name, y = n)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Land-cover class distribution",
+    x = NULL,
+    y = "Observations"
+  ) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+```
+
+# Reshape a row into a four-band image patch
+
+The columns are ordered by pixel first and spectral band second. We reorganize each row into a four-dimensional array with dimensions `(sample, band, row, column)`.
+
+```{r reshape-images}
+feature_columns <- unlist(lapply(1:9, function(pixel) {
+  paste0("pixel_", pixel, "_band_", 1:4)
+}))
+
+X_flat <- as.matrix(landsat[, feature_columns])
+storage.mode(X_flat) <- "double"
+
+class_numbers <- as.integer(names(CLASS_NAMES))
+y_original <- landsat$land_cover
+
+# R torch classification labels are represented here as 1, ..., 6.
+y <- match(y_original, class_numbers)
+
+# Explicit assignment avoids accidental reordering from R's column-major arrays.
+X_image <- array(
+  NA_real_,
+  dim = c(nrow(landsat), 4, 3, 3),
+  dimnames = list(NULL, paste0("band_", 1:4), NULL, NULL)
+)
+
+for (pixel in 1:9) {
+  patch_row <- ((pixel - 1) %/% 3) + 1
+  patch_col <- ((pixel - 1) %% 3) + 1
+
+  for (band in 1:4) {
+    column_name <- paste0("pixel_", pixel, "_band_", band)
+    X_image[, band, patch_row, patch_col] <- landsat[[column_name]]
+  }
+}
+
+cat("Flat input shape:", paste(dim(X_flat), collapse = " × "), "\n")
+cat("CNN input shape:", paste(dim(X_image), collapse = " × "), "\n")
+cat("Target length:", length(y), "\n")
+```
+
+```{r visualize-patch, fig.width=10, fig.height=3.5}
+sample_index <- 12L
+
+patch_plot_data <- expand_grid(
+  band = factor(paste("Band", 1:4), levels = paste("Band", 1:4)),
+  row = 1:3,
+  column = 1:3
+) %>%
+  mutate(
+    band_index = as.integer(band),
+    value = purrr::pmap_dbl(
+      list(band_index, row, column),
+      ~ X_image[sample_index, ..1, ..2, ..3]
+    )
+  )
+
+sample_class <- CLASS_NAMES[as.character(y_original[sample_index])]
+
+ggplot(patch_plot_data, aes(x = column, y = -row, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", value)), size = 3) +
+  facet_wrap(~ band, nrow = 1) +
+  scale_fill_viridis_c() +
+  coord_equal() +
+  scale_x_continuous(breaks = NULL) +
+  scale_y_continuous(breaks = NULL) +
+  labs(
+    title = paste("One 3 × 3 Landsat patch:", sample_class),
+    x = NULL,
+    y = NULL,
+    fill = "Value"
+  )
+```
+
+# See a convolution happen
+
+A kernel is a small matrix of weights. It slides across the image, multiplies local values by its weights, and adds the products. The same weights are reused at every location—this is **weight sharing**.
+
+For a 3 × 3 input and a 2 × 2 kernel with no padding, the output is a 2 × 2 feature map:
+
+$$\text{output size}=3-2+1=2.$$
+
+```{r manual-convolution, fig.width=10, fig.height=3.5}
+# Create tensors with dimensions N × C × H × W.
+input_band_matrix <- X_image[sample_index, 1, , ]
+input_band <- torch_tensor(
+  input_band_matrix,
+  dtype = torch_float()
+)$unsqueeze(1)$unsqueeze(1)
+
+kernel_matrix <- matrix(
+  c(1, -1,
+    1, -1),
+  nrow = 2,
+  byrow = TRUE
+)
+
+kernel <- torch_tensor(
+  kernel_matrix,
+  dtype = torch_float()
+)$unsqueeze(1)$unsqueeze(1)
+
+feature_map <- nnf_conv2d(
+  input = input_band,
+  weight = kernel,
+  stride = 1,
+  padding = 0
+)
+
+feature_map_matrix <- as_array(feature_map)[1, 1, , ]
+
+matrix_to_plot <- function(x, panel_name) {
+  as.data.frame(as.table(x)) %>%
+    transmute(
+      row = as.integer(Var1),
+      column = as.integer(Var2),
+      value = Freq,
+      panel = panel_name
+    )
+}
+
+convolution_plot_data <- bind_rows(
+  matrix_to_plot(input_band_matrix, "Input: band 1"),
+  matrix_to_plot(kernel_matrix, "2 × 2 kernel"),
+  matrix_to_plot(feature_map_matrix, "Output feature map")
+) %>%
+  mutate(panel = factor(
+    panel,
+    levels = c("Input: band 1", "2 × 2 kernel", "Output feature map")
+  ))
+
+ggplot(convolution_plot_data, aes(x = column, y = -row, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", value)), size = 3.5) +
+  facet_wrap(~ panel, nrow = 1) +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick", midpoint = 0) +
+  coord_equal() +
+  scale_x_continuous(breaks = NULL) +
+  scale_y_continuous(breaks = NULL) +
+  labs(x = NULL, y = NULL, fill = "Value")
+```
+
+## Calculate one output by hand
+
+Use the upper-left 2 × 2 portion of the input and the kernel above:
+
+$$z=(x_{11})(1)+(x_{12})(-1)+(x_{21})(1)+(x_{22})(-1).$$
+
+```{r hand-calculation}
+z <- # TODO: complete the hand calculation here
+z
+```
+
+**TODO**  
+1. Confirm that your value matches the upper-left cell of the output feature map.
+2. What local pattern produces a large positive value?
+
+## Change the kernel
+
+Change the kernel to `[[1, 1], [-1, -1]]`.
+
+**TODO**  
+What direction of contrast does it detect?
+
+# Split before learning anything from the data
+
+We use three partitions:
+
+- **Training set:** fit weights and calculate normalization statistics.
+- **Validation set:** monitor training and choose when to stop.
+- **Test set:** estimate final performance once, after modeling decisions are complete.
+
+The test set must not be used to choose epochs, filters, dropout, or any other setting.
+
+```{r split-data}
+stratified_sample <- function(labels, proportion, seed) {
+  set.seed(seed)
+
+  split(seq_along(labels), labels) %>%
+    lapply(function(indices) {
+      n_take <- floor(length(indices) * proportion)
+      sample(indices, size = n_take, replace = FALSE)
+    }) %>%
+    unlist(use.names = FALSE) %>%
+    sort()
+}
+
+all_indices <- seq_along(y)
+
+train_idx <- stratified_sample(y, proportion = 0.70, seed = SEED)
+remaining_idx <- setdiff(all_indices, train_idx)
+
+validation_relative_idx <- stratified_sample(
+  y[remaining_idx],
+  proportion = 0.50,
+  seed = SEED
+)
+
+val_idx <- remaining_idx[validation_relative_idx]
+test_idx <- setdiff(remaining_idx, val_idx)
+
+cat("Training observations:  ", length(train_idx), "\n")
+cat("Validation observations:", length(val_idx), "\n")
+cat("Test observations:      ", length(test_idx), "\n")
+
+split_check <- tibble(
+  split = c(
+    rep("Training", length(train_idx)),
+    rep("Validation", length(val_idx)),
+    rep("Test", length(test_idx))
+  ),
+  class_index = c(y[train_idx], y[val_idx], y[test_idx])
+) %>%
+  count(split, class_index) %>%
+  complete(split, class_index = 1:length(class_numbers), fill = list(n = 0))
+
+kable(split_check)
+```
+
+```{r scale-images}
+# Calculate one mean and standard deviation per band using TRAINING DATA ONLY.
+band_mean <- sapply(1:4, function(band) {
+  mean(X_image[train_idx, band, , ])
+})
+
+band_sd <- sapply(1:4, function(band) {
+  values <- as.numeric(X_image[train_idx, band, , ])
+  sqrt(mean((values - mean(values))^2))
+})
+
+band_sd[band_sd == 0] <- 1
+
+X_scaled <- X_image
+
+for (band in 1:4) {
+  X_scaled[, band, , ] <-
+    (X_image[, band, , ] - band_mean[band]) / band_sd[band]
+}
+
+scaled_training_means <- sapply(1:4, function(band) {
+  mean(X_scaled[train_idx, band, , ])
+})
+
+scaled_training_sds <- sapply(1:4, function(band) {
+  values <- as.numeric(X_scaled[train_idx, band, , ])
+  sqrt(mean((values - mean(values))^2))
+})
+
+cat("Training-band means after scaling:", round(scaled_training_means, 4), "\n")
+cat("Training-band SDs after scaling:  ", round(scaled_training_sds, 4), "\n")
+```
+
+## Leakage check
+
+```{r create-torch-data}
+# Convert arrays to tensors only after splitting and scaling.
+X_train_tensor <- torch_tensor(
+  X_scaled[train_idx, , , , drop = FALSE],
+  dtype = torch_float()
+)
+y_train_tensor <- torch_tensor(y[train_idx], dtype = torch_long())
+
+X_val_tensor <- torch_tensor(
+  X_scaled[val_idx, , , , drop = FALSE],
+  dtype = torch_float()
+)
+y_val_tensor <- torch_tensor(y[val_idx], dtype = torch_long())
+
+X_test_tensor <- torch_tensor(
+  X_scaled[test_idx, , , , drop = FALSE],
+  dtype = torch_float()
+)
+y_test_tensor <- torch_tensor(y[test_idx], dtype = torch_long())
+
+train_dataset <- tensor_dataset(X_train_tensor, y_train_tensor)
+val_dataset <- tensor_dataset(X_val_tensor, y_val_tensor)
+test_dataset <- tensor_dataset(X_test_tensor, y_test_tensor)
+
+# num_workers = 0 keeps the classroom workflow simple and reproducible.
+reset_random_seeds()
+train_loader <- dataloader(
+  train_dataset,
+  batch_size = 128,
+  shuffle = TRUE,
+  num_workers = 0
+)
+val_loader <- dataloader(
+  val_dataset,
+  batch_size = 128,
+  shuffle = FALSE,
+  num_workers = 0
+)
+test_loader <- dataloader(
+  test_dataset,
+  batch_size = 128,
+  shuffle = FALSE,
+  num_workers = 0
+)
+
+cat("Training tensor:", paste(X_train_tensor$size(), collapse = " × "), "\n")
+cat("Validation tensor:", paste(X_val_tensor$size(), collapse = " × "), "\n")
+cat("Test tensor:", paste(X_test_tensor$size(), collapse = " × "), "\n")
+```
+
+# Baseline: multinomial logistic regression
+
+Logistic regression receives the same 36 values, but flattened into a vector. It can assign a separate coefficient to every position and band, but it does not explicitly learn a reusable local pattern.
+
+```{r logistic-baseline}
+# Scale each flattened predictor using training data only.
+flat_mean <- colMeans(X_flat[train_idx, , drop = FALSE])
+flat_sd <- apply(X_flat[train_idx, , drop = FALSE], 2, function(values) {
+  sqrt(mean((values - mean(values))^2))
+})
+flat_sd[flat_sd == 0] <- 1
+
+X_flat_scaled <- sweep(X_flat, 2, flat_mean, FUN = "-")
+X_flat_scaled <- sweep(X_flat_scaled, 2, flat_sd, FUN = "/")
+
+logistic_train <- as.data.frame(X_flat_scaled[train_idx, , drop = FALSE])
+logistic_train$land_cover <- factor(
+  y[train_idx],
+  levels = 1:length(class_numbers)
+)
+
+logistic_model <- multinom(
+  land_cover ~ .,
+  data = logistic_train,
+  trace = FALSE,
+  MaxNWts = 5000
+)
+
+logistic_val_prob <- predict(
+  logistic_model,
+  newdata = as.data.frame(X_flat_scaled[val_idx, , drop = FALSE]),
+  type = "probs"
+)
+
+logistic_test_prob <- predict(
+  logistic_model,
+  newdata = as.data.frame(X_flat_scaled[test_idx, , drop = FALSE]),
+  type = "probs"
+)
+
+logistic_val_pred <- max.col(logistic_val_prob, ties.method = "first")
+logistic_test_pred <- max.col(logistic_test_prob, ties.method = "first")
+
+accuracy_value <- function(observed, predicted) {
+  mean(observed == predicted)
+}
+
+balanced_accuracy_value <- function(observed, predicted, n_classes) {
+  recalls <- sapply(seq_len(n_classes), function(class_index) {
+    class_rows <- observed == class_index
+    mean(predicted[class_rows] == class_index)
+  })
+  mean(recalls)
+}
+
+multiclass_log_loss <- function(observed, probabilities) {
+  selected_probabilities <- probabilities[cbind(seq_along(observed), observed)]
+  -mean(log(pmax(selected_probabilities, 1e-15)))
+}
+
+logistic_results <- tibble(
+  model = "Logistic regression",
+  validation_accuracy = accuracy_value(y[val_idx], logistic_val_pred),
+  test_accuracy = accuracy_value(y[test_idx], logistic_test_pred),
+  test_balanced_accuracy = balanced_accuracy_value(
+    y[test_idx], logistic_test_pred, length(class_numbers)
+  ),
+  test_log_loss = multiclass_log_loss(y[test_idx], logistic_test_prob)
+)
+
+kable(logistic_results, digits = 3)
+```
+
+# Build a small CNN
+
+The network has these stages:
+
+1. **Convolution:** 12 learned 2 × 2 filters examine all four bands.
+2. **ReLU:** negative responses become zero, adding nonlinearity.
+3. **Flatten:** the feature maps become a vector.
+4. **Dense hidden layer:** combines detected local patterns.
+5. **Dropout:** randomly masks some hidden activations during training.
+6. **Output layer:** returns six raw class scores called logits.
+
+We do not use pooling because a 3 × 3 patch is already extremely small.
+
+```{r define-cnn}
+landsat_cnn <- nn_module(
+  classname = "landsat_cnn",
+
+  initialize = function(n_classes = 6, n_filters = 12, dropout = 0.25) {
+    self$n_filters <- n_filters
+    self$conv <- nn_conv2d(
+      in_channels = 4,
+      out_channels = n_filters,
+      kernel_size = 2
+    )
+    self$hidden <- nn_linear(n_filters * 2 * 2, 24)
+    self$dropout <- nn_dropout(p = dropout)
+    self$output <- nn_linear(24, n_classes)
+  },
+
+  forward = function(x) {
+    x <- self$conv(x)
+    x <- nnf_relu(x)
+    x <- torch_flatten(x, start_dim = 2)
+    x <- self$hidden(x)
+    x <- nnf_relu(x)
+    x <- self$dropout(x)
+    self$output(x)
+  }
+)
+
+build_cnn <- function(
+  n_classes = 6,
+  n_filters = 12,
+  dropout = 0.25,
+  seed = SEED
+) {
+  reset_random_seeds(seed)
+  landsat_cnn(
+    n_classes = n_classes,
+    n_filters = n_filters,
+    dropout = dropout
+  )
+}
+
+cnn <- build_cnn(
+  n_classes = length(class_numbers),
+  n_filters = 12,
+  dropout = 0.25
+)
+
+print(cnn)
+
+n_parameters <- sum(vapply(
+  cnn$parameters,
+  function(parameter) parameter$numel(),
+  numeric(1)
+))
+
+cat("Trainable parameters:", n_parameters, "\n")
+```
+
+## Architecture questions
+
+**TODO**  
+1. Why does the convolution produce 12 feature maps?
+2. Why is each feature map 2 × 2?
+3. What does `12 * 2 * 2` represent in the first dense layer?
+4. During evaluation, dropout is turned off. Why?
+
+# Train over epochs with early stopping
+
+An **epoch** is one complete pass through the training set. The optimizer updates the weights after every mini-batch.
+
+Early stopping stores the weights from the epoch with the lowest validation loss. Training stops when validation loss fails to improve for several epochs. This limits wasted computation and helps prevent overfitting.
+
+```{r training-functions}
+copy_state_dict <- function(state_dict) {
+  lapply(state_dict, function(parameter) parameter$clone())
+}
+
+evaluate_loader <- function(model, loader, loss_function) {
+  model$eval()
+
+  total_loss <- 0
+  total_correct <- 0
+  total_n <- 0
+
+  coro::loop(for (batch in loader) {
+    x_batch <- batch[[1]]
+    y_batch <- batch[[2]]
+    batch_n <- y_batch$size(1)
+
+    with_no_grad({
+      logits <- model(x_batch)
+      loss <- loss_function(logits, y_batch)
+      predicted <- logits$argmax(dim = 2)
+    })
+
+    total_loss <- total_loss + loss$item() * batch_n
+    total_correct <- total_correct + (predicted == y_batch)$sum()$item()
+    total_n <- total_n + batch_n
+  })
+
+  list(
+    loss = total_loss / total_n,
+    accuracy = total_correct / total_n
+  )
+}
+
+train_cnn <- function(
+  model,
+  train_loader,
+  val_loader,
+  max_epochs = 50,
+  patience = 7,
+  learning_rate = 0.01
+) {
+  loss_function <- nn_cross_entropy_loss()
+  optimizer <- optim_adam(model$parameters, lr = learning_rate)
+
+  history <- vector("list", max_epochs)
+  best_validation_loss <- Inf
+  best_state <- copy_state_dict(model$state_dict())
+  epochs_without_improvement <- 0L
+  final_epoch <- max_epochs
+
+  for (epoch in seq_len(max_epochs)) {
+    model$train()
+
+    training_loss_sum <- 0
+    training_correct <- 0
+    training_n <- 0
+
+    coro::loop(for (batch in train_loader) {
+      x_batch <- batch[[1]]
+      y_batch <- batch[[2]]
+      batch_n <- y_batch$size(1)
+
+      optimizer$zero_grad()
+      logits <- model(x_batch)
+      loss <- loss_function(logits, y_batch)
+      loss$backward()
+      optimizer$step()
+
+      predicted <- logits$argmax(dim = 2)
+      training_loss_sum <- training_loss_sum + loss$item() * batch_n
+      training_correct <- training_correct +
+        (predicted == y_batch)$sum()$item()
+      training_n <- training_n + batch_n
+    })
+
+    validation <- evaluate_loader(model, val_loader, loss_function)
+
+    history[[epoch]] <- tibble(
+      epoch = epoch,
+      training_loss = training_loss_sum / training_n,
+      validation_loss = validation$loss,
+      training_accuracy = training_correct / training_n,
+      validation_accuracy = validation$accuracy
+    )
+
+    if (validation$loss < best_validation_loss - 1e-4) {
+      best_validation_loss <- validation$loss
+      best_state <- copy_state_dict(model$state_dict())
+      epochs_without_improvement <- 0L
+    } else {
+      epochs_without_improvement <- epochs_without_improvement + 1L
+    }
+
+    if (epoch == 1 || epoch %% 5 == 0) {
+      cat(sprintf(
+        paste0(
+          "Epoch %02d | train loss %.3f | val loss %.3f | ",
+          "train acc %.3f | val acc %.3f\n"
+        ),
+        epoch,
+        training_loss_sum / training_n,
+        validation$loss,
+        training_correct / training_n,
+        validation$accuracy
+      ))
+    }
+
+    if (epochs_without_improvement >= patience) {
+      cat("Early stopping at epoch", epoch, "; restoring best weights.\n")
+      final_epoch <- epoch
+      break
+    }
+  }
+
+  model$load_state_dict(best_state)
+
+  list(
+    model = model,
+    history = bind_rows(history[seq_len(final_epoch)])
+  )
+}
+```
+
+```{r train-cnn}
+# Reset both R and torch seeds immediately before model construction and training.
+reset_random_seeds()
+
+cnn <- build_cnn(
+  n_classes = length(class_numbers),
+  n_filters = 12,
+  dropout = 0.25
+)
+
+# Recreate the shuffled training loader after resetting seeds.
+train_loader <- dataloader(
+  train_dataset,
+  batch_size = 128,
+  shuffle = TRUE,
+  num_workers = 0
+)
+
+cnn_fit <- train_cnn(
+  cnn,
+  train_loader,
+  val_loader,
+  max_epochs = 50,
+  patience = 7,
+  learning_rate = 0.01
+)
+
+cnn <- cnn_fit$model
+history <- cnn_fit$history
+
+kable(tail(history), digits = 3)
+```
+
+```{r learning-curves, fig.width=10, fig.height=4}
+history_long <- history %>%
+  pivot_longer(
+    cols = -epoch,
+    names_to = c("data_split", ".value"),
+    names_pattern = "(training|validation)_(loss|accuracy)"
+  )
+
+loss_plot <- ggplot(history_long, aes(x = epoch, y = loss, color = data_split)) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Loss by epoch",
+    x = "Epoch",
+    y = "Cross-entropy loss",
+    color = "Data"
+  )
+
+accuracy_plot <- ggplot(
+  history_long,
+  aes(x = epoch, y = accuracy, color = data_split)
+) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title = "Accuracy by epoch",
+    x = "Epoch",
+    y = "Accuracy",
+    color = "Data"
+  )
+
+loss_plot
+accuracy_plot
+```
+
+## Read the learning curves
+
+**TODO**  
+1. Around which epoch was validation loss lowest?
+3. What pattern would indicate overfitting?
+4. Why should we select the stopping point using validation loss rather than test accuracy?
+
+# Evaluate the untouched test set
+
+We now use the test set for the first time. Calling `model$eval()` disables dropout and places the network in evaluation mode.
+
+```{r prediction-function}
+predict_loader <- function(model, loader) {
+  model$eval()
+
+  probability_batches <- list()
+  observed_batches <- list()
+  batch_index <- 1L
+
+  coro::loop(for (batch in loader) {
+    x_batch <- batch[[1]]
+    y_batch <- batch[[2]]
+
+    with_no_grad({
+      logits <- model(x_batch)
+      probabilities <- nnf_softmax(logits, dim = 2)
+    })
+
+    probability_batches[[batch_index]] <- as_array(probabilities)
+    observed_batches[[batch_index]] <- as.integer(as_array(y_batch))
+    batch_index <- batch_index + 1L
+  })
+
+  probability_matrix <- do.call(rbind, probability_batches)
+  observed <- unlist(observed_batches, use.names = FALSE)
+  predicted <- max.col(probability_matrix, ties.method = "first")
+
+  list(
+    observed = observed,
+    predicted = predicted,
+    probabilities = probability_matrix
+  )
+}
+
+cnn_test <- predict_loader(cnn, test_loader)
+
+best_epoch_row <- history %>%
+  slice_min(validation_loss, n = 1, with_ties = FALSE)
+
+cnn_results <- tibble(
+  model = "Small CNN",
+  validation_accuracy = best_epoch_row$validation_accuracy,
+  test_accuracy = accuracy_value(cnn_test$observed, cnn_test$predicted),
+  test_balanced_accuracy = balanced_accuracy_value(
+    cnn_test$observed,
+    cnn_test$predicted,
+    length(class_numbers)
+  ),
+  test_log_loss = multiclass_log_loss(
+    cnn_test$observed,
+    cnn_test$probabilities
+  )
+)
+
+model_comparison <- bind_rows(logistic_results, cnn_results)
+kable(model_comparison, digits = 3)
+```
+
+```{r confusion-matrix, fig.width=8, fig.height=7}
+display_names <- unname(CLASS_NAMES[as.character(class_numbers)])
+
+confusion_plot_data <- tibble(
+  observed_index = cnn_test$observed,
+  predicted_index = cnn_test$predicted
+) %>%
+  count(observed_index, predicted_index, name = "n") %>%
+  complete(
+    observed_index = seq_along(display_names),
+    predicted_index = seq_along(display_names),
+    fill = list(n = 0)
+  ) %>%
+  mutate(
+    observed = factor(
+      display_names[observed_index],
+      levels = display_names
+    ),
+    predicted = factor(
+      display_names[predicted_index],
+      levels = display_names
+    )
+  )
+
+ggplot(confusion_plot_data, aes(x = predicted, y = observed, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = n), size = 3.5) +
+  scale_y_discrete(limits = rev(display_names)) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  coord_equal() +
+  labs(
+    title = "CNN confusion matrix: final test set",
+    x = "Predicted class",
+    y = "Observed class",
+    fill = "Count"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Model comparison
+
+1. Which model has higher balanced accuracy?
+2. Which classes are most frequently confused?
+3. Does the CNN clearly outperform logistic regression? If not, give two plausible reasons.
+4. Why is a 3 × 3 patch useful for teaching CNN mechanics but limited compared with a larger satellite image tile?
+
+> A CNN is not automatically better. Its advantage depends on whether local spatial structure contains useful signal, whether the patch is large enough, and whether the amount of training data supports the added flexibility.
+
+# Visualize what the CNN learned
+
+The first convolutional layer contains 12 filters. Each filter has a separate 2 × 2 weight matrix for each of the four input bands. The model combines all four band-specific responses to create one output feature map.
+
+```{r learned-filters, fig.width=8, fig.height=7}
+# R torch stores Conv2D weights as output_filters × input_channels × H × W.
+learned_filters <- as_array(cnn$conv$weight$detach())
+
+filter_plot_data <- expand_grid(
+  filter = 1:dim(learned_filters)[1],
+  row = 1:2,
+  column = 1:2
+) %>%
+  mutate(
+    value = purrr::pmap_dbl(
+      list(filter, row, column),
+      ~ learned_filters[..1, 1, ..2, ..3]
+    ),
+    filter = factor(filter, levels = 1:dim(learned_filters)[1])
+  )
+
+ggplot(filter_plot_data, aes(x = column, y = -row, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", value)), size = 3) +
+  facet_wrap(~ filter, ncol = 4) +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick", midpoint = 0) +
+  coord_equal() +
+  scale_x_continuous(breaks = NULL) +
+  scale_y_continuous(breaks = NULL) +
+  labs(
+    title = "Learned 2 × 2 filter weights for spectral band 1",
+    x = NULL,
+    y = NULL,
+    fill = "Weight"
+  )
+```
+
+```{r feature-maps, fig.width=8, fig.height=7}
+example_position <- 1L
+example_tensor <- X_test_tensor[example_position, , , ]$unsqueeze(1)
+
+cnn$eval()
+with_no_grad({
+  activated_maps_tensor <- cnn$conv(example_tensor) %>% nnf_relu()
+})
+
+activated_maps <- as_array(activated_maps_tensor)[1, , , ]
+
+feature_map_plot_data <- expand_grid(
+  feature_map = 1:dim(activated_maps)[1],
+  row = 1:2,
+  column = 1:2
+) %>%
+  mutate(
+    value = purrr::pmap_dbl(
+      list(feature_map, row, column),
+      ~ activated_maps[..1, ..2, ..3]
+    ),
+    feature_map = factor(feature_map, levels = 1:dim(activated_maps)[1])
+  )
+
+true_class_number <- class_numbers[y[test_idx[example_position]]]
+
+ggplot(feature_map_plot_data, aes(x = column, y = -row, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", value)), size = 3) +
+  facet_wrap(~ feature_map, ncol = 4) +
+  scale_fill_viridis_c(limits = c(0, max(feature_map_plot_data$value))) +
+  coord_equal() +
+  scale_x_continuous(breaks = NULL) +
+  scale_y_continuous(breaks = NULL) +
+  labs(
+    title = paste(
+      "ReLU feature maps for one test patch:",
+      CLASS_NAMES[as.character(true_class_number)]
+    ),
+    x = NULL,
+    y = NULL,
+    fill = "Activation"
+  )
+```
+
+## Interpret the internals carefully
+
+- A bright feature-map cell means that a learned local pattern activated strongly at that location.
+- A dark cell may represent either a weak response or a negative response removed by ReLU.
+- Individual filters do not necessarily have simple human-readable meanings.
+- Learned filters and feature maps help explain computation, but they are not complete causal explanations.
+
+# One-setting-at-a-time experiments
+
+Do **not** use the test set for these experiments. Change one setting, refit from a fresh model, and compare the validation curves.
+
+## Experiment A: learning rate
+
+Refit with `learning_rate = 0.001` and then `learning_rate = 0.05`.
+
+- Which value learns too slowly?
+- Does either value make validation loss unstable?
+
+## Experiment B: dropout
+
+Refit with `dropout = 0.0` and then `dropout = 0.50`.
+
+- Does the gap between training and validation performance change?
+- Does stronger dropout cause underfitting?
+
+## Experiment C: number of filters
+
+Call `build_cnn()` with `n_filters = 4` or `n_filters = 24`. The function calculates the dense-layer input size from the number of filters.
+
+- How does capacity affect training accuracy?
+- Does validation performance improve enough to justify the added complexity?
+
+```{r experiment-starter, eval=FALSE}
+# Change only one setting at a time.
+EXPERIMENT_DROPOUT <- 0.50
+EXPERIMENT_LEARNING_RATE <- 0.01
+EXPERIMENT_FILTERS <- 12L
+EXPERIMENT_SEED <- SEED
+
+reset_random_seeds(EXPERIMENT_SEED)
+
+experiment_model <- build_cnn(
+  n_classes = length(class_numbers),
+  n_filters = EXPERIMENT_FILTERS,
+  dropout = EXPERIMENT_DROPOUT,
+  seed = EXPERIMENT_SEED
+)
+
+experiment_train_loader <- dataloader(
+  train_dataset,
+  batch_size = 128,
+  shuffle = TRUE,
+  num_workers = 0
+)
+
+experiment_fit <- train_cnn(
+  experiment_model,
+  experiment_train_loader,
+  val_loader,
+  max_epochs = 50,
+  patience = 7,
+  learning_rate = EXPERIMENT_LEARNING_RATE
+)
+
+experiment_fit$history
+```
+
+# Final questions
+
+Answer in a few sentences each.
+
+1. What information does the CNN use that logistic regression does not explicitly encode?
+2. What is shared across image locations in a convolutional layer, and why is that useful?
+3. Explain the difference between a learned filter and a feature map.
+4. Based on the evidence from this activity, is a CNN justified for these data? Defend your answer using at least two metrics or plots.
+
+The R `torch` documentation describes `nn_module()` for model definitions, `optim_adam()` for optimization, and `dataloader()` for mini-batch iteration: <https://torch.mlverse.org/docs/>.
