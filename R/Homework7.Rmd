@@ -1,0 +1,630 @@
+---
+title: "Homework: Forecasting Ocean Waves with an LSTM"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+**Dataset:** NOAA National Data Buoy Center station 41004 (Edisto, offshore South Carolina)  
+**Task:** Use the previous 24 hours of ocean and weather observations to predict significant wave height (`WVHT`) three hours ahead.  
+**Models:** Persistence, ridge regression, a multilayer perceptron (MLP), and a long short-term memory network (LSTM).
+
+This assignment asks whether preserving the temporal order of a multivariate environmental sequence improves prediction. A complicated model is useful only if it improves upon honest, simpler baselines.
+
+## Learning goals
+
+By the end of this assignment, you should be able to:
+
+1. Convert multivariate buoy observations into supervised sequences.
+2. Explain why time-series data require temporal rather than random validation.
+3. Fit preprocessing using past observations only.
+4. Compare persistence, linear, non-sequential neural-network, and LSTM forecasts.
+5. Use expanding-window forecast origins for validation and final testing.
+6. Diagnose model performance during both calm and high-wave conditions.
+
+## Submission
+
+Submit the completed R Markdown file, the knitted HTML document, all requested figures and tables, and written responses to the Final Questions. Restart knit the document before submission.
+
+```{r setup, message=FALSE, warning=FALSE}
+# Install before knitting if needed:
+# install.packages(c(
+#   "torch", "coro", "readr", "dplyr", "tidyr", "purrr",
+#   "ggplot2", "lubridate", "tibble", "knitr", "zoo", "glmnet"
+# ))
+# torch::install_torch()
+
+library(torch)
+library(coro)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(lubridate)
+library(tibble)
+library(knitr)
+library(zoo)
+library(glmnet)
+
+SEED <- 42
+
+reset_seeds <- function(seed = SEED) {
+  set.seed(seed)
+  torch_manual_seed(seed)
+}
+
+reset_seeds()
+theme_set(theme_minimal(base_size = 11))
+```
+
+# Load NOAA buoy observations
+
+Station 41004 is approximately 41 nautical miles southeast of Charleston, South Carolina. NOAA provides annual compressed standard-meteorological files. We will use 2018–2024. The files have already been downloaded and are stored on GitHub.
+
+```{r load-data}
+data_url <- "https://raw.githubusercontent.com/dblaskey/ML_Course_Code/main/Data/noaa_wave_height.csv"
+
+hourly <- read_csv(data_url, show_col_types = FALSE)
+
+feature_names <- c(
+  "WVHT", "WSPD", "DPD", "APD", "PRES", "ATMP", "WTMP",
+  "mwd_sin", "mwd_cos", "hour_sin", "hour_cos", "year_sin", "year_cos"
+)
+
+cat("Date range:", format(min(hourly$time)), "to", format(max(hourly$time)), "\n")
+cat("Hourly rows:", nrow(hourly), "\n")
+
+hourly %>%
+  summarise(across(all_of(c(feature_names, "target_wvht")), ~ mean(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "missing_fraction") %>%
+  kable(digits = 3)
+```
+
+```{r plot-data, fig.height=8, fig.width=12}
+hourly %>%
+  filter(year(time) == 2024) %>%
+  select(time, `Wave height (m)` = target_wvht,
+         `Wind speed (m/s)` = WSPD, `Pressure (hPa)` = PRES) %>%
+  pivot_longer(-time, names_to = "variable", values_to = "value") %>%
+  ggplot(aes(time, value)) +
+  geom_line(color = "navy", linewidth = 0.35, na.rm = TRUE) +
+  facet_wrap(~ variable, ncol = 1, scales = "free_y") +
+  labs(title = "Buoy 41004 observations during 2024", x = "Time", y = NULL)
+```
+
+# Convert the record into supervised sequences
+
+Each sample uses 24 hourly rows ending at forecast origin \(t\) and predicts observed significant wave height at \(t+3\) hours. A persistence forecast predicts that the future wave height will equal the most recently observed wave height.
+
+```{r make-sequences}
+LOOKBACK <- 24
+HORIZON <- 3
+
+make_sequences <- function(frame, features, lookback = 24, horizon = 3) {
+  values <- as.matrix(frame[, features])
+  target <- frame$target_wvht
+  max_samples <- nrow(frame) - lookback - horizon + 1
+
+  X <- array(NA_real_, dim = c(max_samples, lookback, length(features)))
+  y <- rep(NA_real_, max_samples)
+  origin_time <- as.POSIXct(rep(NA_real_, max_samples), origin = "1970-01-01", tz = "UTC")
+  target_time <- origin_time
+  persistence <- rep(NA_real_, max_samples)
+
+  count <- 0L
+  for (end_index in lookback:(nrow(frame) - horizon)) {
+    start_index <- end_index - lookback + 1
+    target_index <- end_index + horizon
+    window <- values[start_index:end_index, , drop = FALSE]
+
+    if (anyNA(window) || is.na(target[target_index])) next
+
+    count <- count + 1L
+    X[count, , ] <- window
+    y[count] <- target[target_index]
+    origin_time[count] <- frame$time[end_index]
+    target_time[count] <- frame$time[target_index]
+    persistence[count] <- values[end_index, match("WVHT", features)]
+  }
+
+  keep <- seq_len(count)
+  list(
+    X = X[keep, , , drop = FALSE],
+    y = y[keep],
+    info = tibble(
+      origin_time = origin_time[keep],
+      target_time = target_time[keep],
+      persistence = persistence[keep]
+    )
+  )
+}
+
+sequences <- make_sequences(hourly, feature_names, LOOKBACK, HORIZON)
+X_all <- sequences$X
+y_all <- sequences$y
+sequence_info <- sequences$info
+
+cat("X dimensions (samples, hours, features):", dim(X_all), "\n")
+cat("y length:", length(y_all), "\n")
+kable(head(sequence_info))
+```
+
+# Define expanding forecast origins
+
+Random cross-validation would allow observations from the future to influence models evaluated in the past. Instead, each forecast origin uses all eligible samples available before the forecast month and predicts the following month.
+
+For manageable homework runtime, the default uses January, April, July, and October forecast months.
+
+- **2023 origins:** validation and model selection
+- **2024 origins:** untouched final testing
+
+
+
+```{r forecast-origins}
+origin_months <- c(1, 4, 7, 10)
+
+validation_origins <- make_datetime(2023, origin_months, 1, tz = "UTC")
+test_origins <- make_datetime(2024, origin_months, 1, tz = "UTC")
+
+month_end_exclusive <- function(origin) origin %m+% months(1)
+
+walk(validation_origins, ~ cat(
+  "Train through", format(.x - hours(1)),
+  "; forecast", format(.x, "%Y-%m"), "\n"
+))
+```
+
+# Prepare one leakage-safe forecast origin
+
+The helper below:
+
+1. Selects training samples whose targets occur before the forecast month.
+2. Reserves the final 30 days of that historical record for early stopping.
+3. Fits feature and target scalers using the remaining training data only.
+4. Applies those scalers to internal-validation and forecast samples.
+5. Limits training to the most recent 30,000 sequences for practical runtime.
+
+```{r prepare-origin}
+MAX_TRAIN_SAMPLES <- 30000
+INNER_VALIDATION_DAYS <- 30
+
+scale_array <- function(X, centers, scales) {
+  scales[is.na(scales) | scales == 0] <- 1
+  sweep(sweep(X, 3, centers, FUN = "-"), 3, scales, FUN = "/")
+}
+
+prepare_origin <- function(origin) {
+  forecast_end <- month_end_exclusive(origin)
+  train_index <- which(sequence_info$target_time < origin)
+  forecast_index <- which(
+    sequence_info$target_time >= origin & sequence_info$target_time < forecast_end
+  )
+
+  if (length(train_index) == 0 || length(forecast_index) == 0) {
+    stop("Insufficient data for forecast origin ", origin)
+  }
+
+  train_index <- tail(train_index, MAX_TRAIN_SAMPLES)
+  inner_cutoff <- origin - days(INNER_VALIDATION_DAYS)
+  inner_index <- train_index[sequence_info$target_time[train_index] >= inner_cutoff]
+  fit_index <- setdiff(train_index, inner_index)
+
+  X_fit_raw <- X_all[fit_index, , , drop = FALSE]
+  feature_center <- apply(X_fit_raw, 3, mean)
+  feature_scale <- apply(X_fit_raw, 3, sd)
+  target_center <- mean(y_all[fit_index])
+  target_scale <- sd(y_all[fit_index])
+
+  list(
+    X_fit = scale_array(X_fit_raw, feature_center, feature_scale),
+    y_fit = (y_all[fit_index] - target_center) / target_scale,
+    X_inner = scale_array(X_all[inner_index, , , drop = FALSE], feature_center, feature_scale),
+    y_inner = (y_all[inner_index] - target_center) / target_scale,
+    X_forecast = scale_array(X_all[forecast_index, , , drop = FALSE], feature_center, feature_scale),
+    y_forecast = y_all[forecast_index],
+    forecast_info = sequence_info[forecast_index, ],
+    target_center = target_center,
+    target_scale = target_scale
+  )
+}
+
+example_fold <- prepare_origin(validation_origins[1])
+cat("X_fit:", dim(example_fold$X_fit), "\n")
+cat("X_inner:", dim(example_fold$X_inner), "\n")
+cat("X_forecast:", dim(example_fold$X_forecast), "\n")
+```
+
+# Build the comparison models
+
+Ridge regression receives a flattened 24 × feature input. The MLP also receives a flattened input, allowing nonlinear relationships but discarding the explicit sequence organization. The LSTM receives a 24 × feature sequence.
+
+```{r model-classes}
+wave_mlp <- nn_module(
+  classname = "wave_mlp",
+  initialize = function(lookback, n_features, hidden_units = 32, dropout = 0.10) {
+    self$flatten <- nn_flatten(start_dim = 2)
+    self$hidden <- nn_linear(lookback * n_features, hidden_units)
+    self$activation <- nn_relu()
+    self$dropout <- nn_dropout(p = dropout)
+    self$output <- nn_linear(hidden_units, 1)
+  },
+  forward = function(x) {
+    x %>%
+      self$flatten() %>%
+      self$hidden() %>%
+      self$activation() %>%
+      self$dropout() %>%
+      self$output()
+  }
+)
+
+wave_lstm <- nn_module(
+  classname = "wave_lstm",
+  initialize = function(n_features, hidden_units = 32, dropout = 0.10) {
+    self$lstm <- nn_lstm(
+      input_size = n_features,
+      hidden_size = hidden_units,
+      batch_first = TRUE
+    )
+    self$dropout <- nn_dropout(p = dropout)
+    self$output <- nn_linear(hidden_units, 1)
+  },
+  forward = function(x) {
+    sequence_output <- self$lstm(x)[[1]]
+    final_step <- sequence_output$select(2, sequence_output$size(2))
+    final_step %>% self$dropout() %>% self$output()
+  }
+)
+```
+
+# Fit and evaluate one forecast origin
+
+The training helper below implements epochs, mini-batches, dropout, and early stopping.
+
+```{r torch-training-helper}
+train_torch_model <- function(model, X_fit, y_fit, X_inner, y_inner,
+                              learning_rate = 0.001, batch_size = 64,
+                              max_epochs = 60, patience = 8) {
+  train_dataset <- tensor_dataset(
+    torch_tensor(X_fit, dtype = torch_float()),
+    torch_tensor(y_fit, dtype = torch_float())$unsqueeze(2)
+  )
+  train_loader <- dataloader(train_dataset, batch_size = batch_size, shuffle = TRUE)
+  X_inner_tensor <- torch_tensor(X_inner, dtype = torch_float())
+  y_inner_tensor <- torch_tensor(y_inner, dtype = torch_float())$unsqueeze(2)
+  optimizer <- optim_adam(model$parameters, lr = learning_rate)
+  loss_function <- nn_mse_loss()
+
+  best_loss <- Inf
+  best_state <- NULL
+  epochs_without_improvement <- 0
+  history <- tibble(epoch = integer(), train_loss = double(), validation_loss = double())
+
+  for (epoch in seq_len(max_epochs)) {
+    model$train()
+    batch_losses <- c()
+    coro::loop(for (batch in train_loader) {
+      optimizer$zero_grad()
+      prediction <- model(batch[[1]])
+      loss <- loss_function(prediction, batch[[2]])
+      loss$backward()
+      optimizer$step()
+      batch_losses <- c(batch_losses, loss$item())
+    })
+
+    model$eval()
+    validation_loss <- with_no_grad({
+      loss_function(model(X_inner_tensor), y_inner_tensor)$item()
+    })
+    history <- add_row(history, epoch = epoch, train_loss = mean(batch_losses),
+                       validation_loss = validation_loss)
+
+    if (validation_loss < best_loss - 1e-6) {
+      best_loss <- validation_loss
+      best_state <- lapply(model$state_dict(), function(x) x$clone())
+      epochs_without_improvement <- 0
+    } else {
+      epochs_without_improvement <- epochs_without_improvement + 1
+    }
+    if (epochs_without_improvement >= patience) break
+  }
+
+  model$load_state_dict(best_state)
+  list(model = model, history = history)
+}
+
+predict_torch <- function(model, X) {
+  model$eval()
+  with_no_grad({
+    as.numeric(model(torch_tensor(X, dtype = torch_float()))$squeeze(2))
+  })
+}
+```
+
+```{r evaluate-origin}
+regression_metrics <- function(observed, predicted) {
+  tibble(
+    rmse = sqrt(mean((observed - predicted)^2)),
+    mae = mean(abs(observed - predicted))
+  )
+}
+
+flatten_sequences <- function(X) matrix(X, nrow = dim(X)[1])
+
+evaluate_origin <- function(origin, settings) {
+  fold <- prepare_origin(origin)
+  predictions <- fold$forecast_info %>%
+    transmute(target_time, observed = fold$y_forecast, Persistence = persistence)
+
+  ridge_X <- flatten_sequences(fold$X_fit)
+  # glmnet scales squared error by sample size, while sklearn::Ridge does not.
+  # Dividing by n makes the two penalty values comparable.
+  ridge_lambda <- settings$ridge_alpha / nrow(ridge_X)
+  ridge_fit <- glmnet(
+    x = ridge_X,
+    y = fold$y_fit,
+    alpha = 0,
+    lambda = ridge_lambda,
+    standardize = FALSE
+  )
+  ridge_scaled <- as.numeric(predict(
+    ridge_fit,
+    newx = flatten_sequences(fold$X_forecast),
+    s = ridge_lambda
+  ))
+  predictions$Ridge <- ridge_scaled * fold$target_scale + fold$target_center
+
+  reset_seeds()
+  mlp <- wave_mlp(
+    lookback = dim(fold$X_fit)[2],
+    n_features = dim(fold$X_fit)[3],
+    hidden_units = settings$hidden_units,
+    dropout = settings$dropout
+  )
+  mlp_fit <- train_torch_model(
+    mlp, fold$X_fit, fold$y_fit, fold$X_inner, fold$y_inner,
+    learning_rate = settings$learning_rate,
+    batch_size = settings$batch_size,
+    max_epochs = settings$max_epochs,
+    patience = settings$patience
+  )
+  mlp_scaled <- predict_torch(mlp_fit$model, fold$X_forecast)
+  predictions$MLP <- mlp_scaled * fold$target_scale + fold$target_center
+
+  reset_seeds()
+  lstm <- wave_lstm(
+    n_features = dim(fold$X_fit)[3],
+    hidden_units = settings$hidden_units,
+    dropout = settings$dropout
+  )
+  lstm_fit <- train_torch_model(
+    lstm, fold$X_fit, fold$y_fit, fold$X_inner, fold$y_inner,
+    learning_rate = settings$learning_rate,
+    batch_size = settings$batch_size,
+    max_epochs = settings$max_epochs,
+    patience = settings$patience
+  )
+  lstm_scaled <- predict_torch(lstm_fit$model, fold$X_forecast)
+  predictions$LSTM <- lstm_scaled * fold$target_scale + fold$target_center
+
+  rm(mlp, mlp_fit, lstm, lstm_fit)
+  gc()
+  predictions
+}
+default_settings <- list(
+  ridge_alpha = 10, hidden_units = 32, dropout = 0.10,
+  learning_rate = 0.001, batch_size = 64, max_epochs = 60, patience = 8
+)
+```
+
+# Expanding-window validation
+
+Run the model at each 2023 origin, combine the forecasts, and calculate overall metrics. 
+
+```{r validation-run}
+run_origins <- function(origins, settings) {
+  map2_dfr(origins, seq_along(origins), function(origin, index) {
+    message("Origin ", index, "/", length(origins), ": ", format(origin, "%Y-%m"))
+    evaluate_origin(origin, settings) %>% mutate(origin = origin, .before = 1)
+  })
+}
+
+validation_predictions <- run_origins(validation_origins, default_settings)
+```
+
+```{r summarize-validation}
+summarize_predictions <- function(predictions) {
+  predictions %>%
+    pivot_longer(-c(origin, target_time, observed), names_to = "model", values_to = "predicted") %>%
+    group_by(model) %>%
+    summarise(
+      rmse = sqrt(mean((observed - predicted)^2)),
+      mae = mean(abs(observed - predicted)),
+      .groups = "drop"
+    ) %>%
+    arrange(rmse)
+}
+
+validation_metrics <- summarize_predictions(validation_predictions)
+kable(validation_metrics, digits = 3)
+```
+
+# Controlled LSTM experiments
+
+Change **one setting at a time** and evaluate only on the 2023 origins. Record each experiment in a table.
+
+1. Hidden units: 8 versus 32
+2. Lookback: 24 or 48 hours
+3. Dropout: 0.0 versus 0.20
+4. Learning rate: 0.0003 versus 0.001
+5. Forecast horizon: 3 or 6 hours
+6. One of your choosing #TODO
+
+```{r controlled-experiments}
+evaluate_configuration <- function(label, settings, lookback = 24, horizon = 3) {
+  old_X <- X_all
+  old_y <- y_all
+  old_info <- sequence_info
+  on.exit({
+    X_all <<- old_X
+    y_all <<- old_y
+    sequence_info <<- old_info
+  })
+
+  temporary <- make_sequences(hourly, feature_names, lookback, horizon)
+  X_all <<- temporary$X
+  y_all <<- temporary$y
+  sequence_info <<- temporary$info
+
+  predictions <- run_origins(validation_origins, settings)
+  lstm_result <- summarize_predictions(predictions) %>% filter(model == "LSTM")
+  tibble(
+    experiment = label,
+    lookback = lookback,
+    horizon = horizon,
+    hidden_units = settings$hidden_units,
+    dropout = settings$dropout,
+    learning_rate = settings$learning_rate,
+    lstm_rmse = lstm_result$rmse,
+    lstm_mae = lstm_result$mae
+  )
+}
+
+settings_8 <- default_settings
+settings_8$hidden_units <- 8
+
+settings_dropout <- default_settings
+settings_dropout$dropout <- 0.20
+
+settings_lr <- default_settings
+settings_lr$learning_rate <- 0.0003
+
+settings_trial <- default_settings
+settings_trial$ <- #TODO
+
+experiment_results <- bind_rows(
+  evaluate_configuration("8 hidden units", settings_8, 24, 3),
+  evaluate_configuration("dropout 0.20", settings_dropout, 24, 3),
+  evaluate_configuration("learning rate 0.0003", settings_lr, 24, 3),
+  evaluate_configuration("6-hour horizon", default_settings, 24, 6),
+  evaluate_configuration("48-hour lookback", default_settings, 48, 3)
+  evaluate_configuration("My Trial", settings_trial, 24, 3)
+)
+
+experiment_results <- experiment_results %>%
+  arrange(lstm_rmse)
+
+kable(
+  experiment_results,
+  digits = 3,
+  caption = "LSTM validation experiments"
+)
+```
+# Final expanding-window test
+
+Enter the settings selected from 2023 validation.
+
+```{r final-test}
+# Retain the default unless the 2023 validation evidence supports a change.
+final_settings <- default_settings
+
+test_predictions <- run_origins(test_origins, final_settings)
+test_metrics <- summarize_predictions(test_predictions)
+kable(test_metrics, digits = 3)
+```
+
+```{r forecast-plot, fig.height=7, fig.width=12}
+test_predictions %>%
+  pivot_longer(
+    cols = c(observed, Persistence, Ridge, MLP, LSTM),
+    names_to = "series",
+    values_to = "wave_height_m"
+  ) %>%
+  ggplot(aes(target_time, wave_height_m, color = series)) +
+  geom_line(linewidth = 0.35, alpha = 0.85) +
+  facet_wrap(~ origin, ncol = 1, scales = "free_x") +
+  labs(
+    title = "Three-hour wave forecasts at expanding 2024 origins",
+    x = "Time", y = "Significant wave height (m)", color = NULL
+  )
+```
+
+# Diagnose calm and high-wave performance
+
+Overall averages can hide poor performance during hazardous conditions. Define high-wave observations using the 90th percentile of **historical pre-2024 observed wave height**, not the test distribution. Then compare calm/moderate and high-wave errors.
+
+```{r wave-regimes}
+historical_index <- which(
+  sequence_info$target_time < ymd_hms("2024-01-01 00:00:00", tz = "UTC")
+)
+high_wave_threshold <- quantile(y_all[historical_index], 0.90, na.rm = TRUE)
+cat("Historical 90th-percentile threshold:", high_wave_threshold, "m
+")
+
+regime_metrics <- test_predictions %>%
+  mutate(
+    wave_regime = if_else(
+      observed >= high_wave_threshold, "High wave", "Calm/moderate"
+    )
+  ) %>%
+  pivot_longer(
+    cols = c(Persistence, Ridge, MLP, LSTM),
+    names_to = "model", values_to = "predicted"
+  ) %>%
+  group_by(wave_regime, model) %>%
+  summarise(
+    n = n(),
+    rmse = sqrt(mean((observed - predicted)^2)),
+    mae = mean(abs(observed - predicted)),
+    .groups = "drop"
+  ) %>%
+  arrange(wave_regime, rmse)
+
+kable(regime_metrics, digits = 3)
+```
+
+```{r residual-diagnostics, fig.height=5, fig.width=11}
+residual_data <- test_predictions %>%
+  mutate(residual = observed - LSTM)
+
+p_time <- ggplot(residual_data, aes(target_time, residual)) +
+  geom_point(alpha = 0.35, size = 0.8) +
+  geom_hline(yintercept = 0, linewidth = 0.5) +
+  labs(
+    title = "LSTM residuals through time",
+    x = "Target time", y = "Observed - predicted WVHT (m)"
+  )
+
+p_height <- ggplot(residual_data, aes(observed, residual)) +
+  geom_point(alpha = 0.35, size = 0.8) +
+  geom_hline(yintercept = 0, linewidth = 0.5) +
+  geom_vline(xintercept = high_wave_threshold, linetype = "dashed", color = "red") +
+  labs(
+    title = "Residuals versus observed wave height",
+    x = "Observed WVHT (m)", y = "Observed - predicted WVHT (m)"
+  )
+
+p_time
+p_height
+```
+
+# Final Questions
+
+Answer the following:
+
+1. What does each of the three dimensions of `X_all` represent?
+2. Why is the target located three rows after the final input row?
+3. What information does persistence use, and what potentially useful information does it ignore?
+4. Why can complete sequence samples be shuffled while the 24 timesteps inside each sequence must remain ordered?
+5. What does `restore_best_weights=True` accomplish?
+6. Which model has the lowest validation RMSE and MAE during validation? Does the LSTM improve upon persistence?
+7. Does the LSTM improve upon the MLP? What does that comparison suggest about preserving sequence structure?
+8. Which model performs best on the untouched 2024 test origins? Does the model ranking agree with the 2023 validation ranking?
+9. Does the best overall model remain best during high-wave conditions?
+10. Does the LSTM systematically underpredict the largest waves?
+11. Why can a small overall RMSE conceal an important operational weakness?
+12. Was the LSTM appropriate for this marine forecasting task?
+

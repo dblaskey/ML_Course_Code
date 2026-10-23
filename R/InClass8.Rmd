@@ -272,7 +272,7 @@ z
 
 **TODO**  
 1. Confirm that your value matches the upper-left cell of the output feature map.
-2. What local pattern produces a large positive value?
+2. In general, what local pattern produces a large positive value?
 
 ## Change the kernel
 
@@ -983,22 +983,13 @@ Do **not** use the test set for these experiments. Change one setting, refit fro
 
 Refit with `learning_rate = 0.001` and then `learning_rate = 0.05`.
 
-- Which value learns too slowly?
-- Does either value make validation loss unstable?
-
 ## Experiment B: dropout
 
 Refit with `dropout = 0.0` and then `dropout = 0.50`.
 
-- Does the gap between training and validation performance change?
-- Does stronger dropout cause underfitting?
-
 ## Experiment C: number of filters
 
 Call `build_cnn()` with `n_filters = 4` or `n_filters = 24`. The function calculates the dense-layer input size from the number of filters.
-
-- How does capacity affect training accuracy?
-- Does validation performance improve enough to justify the added complexity?
 
 ```{r experiment-starter, eval=FALSE}
 # Change only one setting at a time.
