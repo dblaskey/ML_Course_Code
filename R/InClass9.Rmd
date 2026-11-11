@@ -1,0 +1,535 @@
+---
+title: "In-Class 9: Comparing Tree-Based Feature Importance Methods"
+subtitle: "Marine-science application: predicting abalone age"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+In this activity, we will fit one random-forest regression model and explain it in three different ways:
+
+1. Impurity-based importance (mean decrease in impurity, or MDI)
+2. Permutation importance measured on held-out test data
+3. SHAP values for global and individual prediction explanations
+
+Learning objectives
+
+By the end of class, you should be able to:
+
+- distinguish model-specific importance from performance-based importance;
+- calculate and visualize MDI, permutation importance, and SHAP importance;
+- explain why correlated predictors can divide or hide importance;
+- distinguish global explanations from local explanations;
+- identify common ways feature-importance plots can be overinterpreted.
+
+**R implementation:** `ranger` fits the forest; `treeshap` calculates TreeSHAP values and `shapviz` draws their plots. All three methods explain the same fitted R model.
+
+```{r cell-1}
+# Install once in the Console before knitting:
+# install.packages(c("rmarkdown", "knitr", "readr", "dplyr", "tidyr",
+#                    "ggplot2", "ranger", "treeshap", "shapviz"))
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ranger)
+library(treeshap)
+library(shapviz)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+                     fig.width = 9, fig.height = 6)
+SEED <- 42
+set.seed(SEED)
+theme_set(theme_minimal(base_size = 12))
+show_table <- function(x, digits = 4) knitr::kable(x, digits = digits)
+
+# Explicit metrics, including the traditional sklearn-style R-squared.
+regression_metrics <- function(observed, predicted) {
+  tibble(RMSE = sqrt(mean((observed - predicted)^2)),
+         MAE = mean(abs(observed - predicted)),
+         R2 = 1 - sum((observed - predicted)^2) /
+           sum((observed - mean(observed))^2))
+}
+predict_forest <- function(model, newdata) {
+  as.numeric(predict(model, data = as.data.frame(newdata), num.threads = 1)$predictions)
+}
+fit_forest <- function(X, y) {
+  ranger::ranger(x = as.data.frame(X), y = y, num.trees = 300,
+    mtry = max(1L, floor(sqrt(ncol(X)))), min.node.size = 3,
+    importance = "impurity", write.forest = TRUE,
+    seed = SEED, num.threads = 1)
+}
+
+# Importance on exactly the supplied held-out rows, WITHOUT refitting.
+rmse_permutation <- function(model, X, y, n_repeats = 20, seed = SEED) {
+  set.seed(seed)
+  original_rmse <- sqrt(mean((y - predict_forest(model, X))^2))
+  bind_rows(lapply(names(X), function(feature) {
+    changes <- replicate(n_repeats, {
+      shuffled <- X
+      shuffled[[feature]] <- sample(shuffled[[feature]])
+      sqrt(mean((y - predict_forest(model, shuffled))^2)) - original_rmse
+    })
+    # Python's permutation_importance uses population SD (ddof = 0).
+    tibble(feature = feature, permutation_mean = mean(changes),
+           permutation_sd = sqrt(mean((changes - mean(changes))^2)))
+  })) %>% arrange(desc(permutation_mean))
+}
+
+mdi_table <- function(model) {
+  v <- model$variable.importance
+  tibble(feature = names(v), mdi = as.numeric(v / sum(v))) %>%
+    arrange(desc(mdi))
+}
+shap_table <- function(S) {
+  tibble(feature = colnames(S), shap_mean_abs = colMeans(abs(S))) %>%
+    arrange(desc(shap_mean_abs))
+}
+rank_importance <- function(x) {
+  x %>% mutate(mdi_rank = min_rank(desc(mdi)),
+               permutation_rank = min_rank(desc(permutation_mean)),
+               shap_rank = min_rank(desc(shap_mean_abs)))
+}
+
+# Annotated heatmap with explicit factor levels: every cell receives a label.
+correlation_plot <- function(M, title, lower_only = FALSE) {
+  labels <- colnames(M)
+  tab <- as.data.frame(as.table(M), stringsAsFactors = FALSE)
+  names(tab) <- c("row", "column", "value")
+  tab$i <- match(tab$row, labels)
+  tab$j <- match(tab$column, labels)
+  if (lower_only) tab <- tab[tab$i >= tab$j, ]
+  tab$row <- factor(tab$row, levels = rev(labels))
+  tab$column <- factor(tab$column, levels = labels)
+  ggplot(tab, aes(column, row, fill = value)) +
+    geom_tile(color = "white", linewidth = 0.6) +
+    geom_text(aes(label = sprintf("%.2f", value),
+                  color = abs(value) > 0.60), size = 3.7) +
+    scale_color_manual(values = c("FALSE" = "#333333", "TRUE" = "white"),
+                       guide = "none") +
+    scale_fill_gradient2(low = "#27658C", mid = "white", high = "#B13C49",
+                         midpoint = 0, limits = c(-1, 1), name = "Correlation") +
+    coord_fixed() +
+    labs(title = title, x = NULL, y = NULL) +
+    theme(panel.grid = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1))
+}
+```
+
+## Load and inspect the abalone data
+
+```{r cell-3}
+column_names <- c("sex", "length", "diameter", "height", "whole_weight",
+                  "shucked_weight", "viscera_weight", "shell_weight", "rings")
+data_url <- "https://raw.githubusercontent.com/dblaskey/ML_Course_Code/main/Data/abalone.csv"
+data_source <- if (file.exists("abalone.csv")) "abalone.csv" else data_url
+abalone <- readr::read_csv(data_source, col_names = column_names,
+  col_types = cols(sex = col_character(), .default = col_double()),
+  show_col_types = FALSE)
+stopifnot(!anyNA(abalone), all(abalone$sex %in% c("F", "I", "M")))
+cat("Shape:", nrow(abalone), "rows x", ncol(abalone), "columns\n")
+show_table(head(abalone))
+summary(abalone)
+```
+
+```{r cell-4}
+numeric_data <- abalone %>% select(where(is.numeric))
+corr <- cor(numeric_data)
+correlation_plot(corr, "Correlations Among Abalone Measurements", lower_only = TRUE)
+```
+
+## Split the data
+
+```{r cell-6}
+# Split raw rows first
+set.seed(SEED)
+train_index <- sample.int(nrow(abalone), floor(0.8 * nrow(abalone)))
+test_index <- setdiff(seq_len(nrow(abalone)), train_index)
+
+# Make dummy variables
+encode_predictors <- function(frame) {
+  frame %>% select(-rings, -sex) %>%
+    mutate(sex_I = as.numeric(frame$sex == "I"),
+           sex_M = as.numeric(frame$sex == "M")) %>% as.data.frame()
+}
+X_train <- encode_predictors(abalone[train_index, ])
+X_test <- encode_predictors(abalone[test_index, ])
+y_train <- abalone$rings[train_index]
+y_test <- abalone$rings[test_index]
+feature_names <- names(X_train)
+cat("Training rows:", nrow(X_train), "| Test rows:", nrow(X_test), "\n")
+cat("Features:", paste(feature_names, collapse = ", "), "\n")
+```
+
+## Fit and evaluate the model
+
+```{r cell-8}
+forest <- fit_forest(X_train, y_train)
+```
+
+```{r cell-9}
+forest_pred <- predict_forest(forest, X_test)
+show_table(regression_metrics(y_test, forest_pred))
+```
+
+## Method 1: impurity-based importance
+
+For a regression forest, each split is selected to reduce squared-error impurity. Ranger reports accumulated impurity reductions. Here we normalize them to sum to 1 for a comparable display; implementation details differ from scikit-learn.
+
+This is often called **mean decrease in impurity (MDI)**.
+
+### What question does it answer?
+
+> How much did the fitted forest use this feature to reduce training impurity across all of its splits?
+
+### Strengths
+
+- essentially free after model fitting;
+- fast and easy to calculate;
+- summarizes how the fitted forest constructed its trees.
+
+### Limitations
+
+- calculated from training splits rather than held-out predictive performance;
+- can favor continuous or high-cardinality predictors because they provide more possible split points;
+- correlated predictors can share or steal importance;
+- does not show whether a feature pushes predictions higher or lower;
+- global importance does not explain any single observation.
+
+```{r cell-11}
+mdi_importance <- mdi_table(forest)
+show_table(mdi_importance)
+ggplot(mdi_importance, aes(mdi, reorder(feature, mdi))) +
+  geom_col(fill = "steelblue") +
+  labs(x = "Normalized mean decrease in impurity", y = NULL,
+       title = "Random-forest impurity-based importance")
+```
+
+## Method 2: permutation importance
+
+Permutation importance measures how much model performance worsens after one predictor is shuffled. Shuffling breaks that predictor's relationship with the outcome while leaving the fitted model unchanged.
+
+We calculate it on the **test set** and use RMSE as the scoring metric.
+
+For this scoring setup:
+
+$$
+\text{Permutation importance}_j
+=
+\text{RMSE after shuffling feature }j
+-
+\text{original RMSE}
+$$
+
+A large positive value means shuffling the predictor increased test error substantially.
+
+### What question does it answer?
+
+> How much does held-out predictive performance depend on this feature?
+
+### Strengths
+
+- evaluated with a chosen performance metric;
+- can be calculated on held-out data;
+- model-agnostic;
+- repeated permutations provide a measure of variability.
+
+### Limitations
+
+- correlated predictors can substitute for one another, making each look less important;
+- shuffling may create unrealistic combinations of environmental measurements;
+- results depend on the evaluation set and scoring metric;
+- slower than built-in MDI.
+
+```{r cell-13}
+permutation_df <- rmse_permutation(forest, X_test, y_test)
+show_table(permutation_df)
+```
+
+```{r cell-14}
+ggplot(permutation_df, aes(permutation_mean, reorder(feature, permutation_mean))) +
+  geom_col(fill = "darkorange", alpha = 0.85) +
+  geom_segment(aes(x = permutation_mean - permutation_sd,
+                   xend = permutation_mean + permutation_sd,
+                   yend = reorder(feature, permutation_mean)), linewidth = 0.6) +
+  geom_vline(xintercept = 0, linewidth = 0.5) +
+  labs(x = "Increase in test RMSE after permutation", y = NULL,
+       title = "Permutation importance on held-out data",
+       subtitle = "Error lines: +/- one shuffle SD")
+```
+
+### Question 1
+
+1. Which features differ most between the MDI and permutation rankings?
+2. What does an importance close to zero mean?
+3. Could an importance be negative? What would that suggest?
+
+## Method 3: SHAP values
+
+SHAP assigns each feature a contribution to a prediction relative to a baseline prediction. For one observation:
+
+$$
+\widehat{y}_i
+=
+\text{baseline}
++
+\sum_{j=1}^{p}\phi_{ij}
+$$
+
+where $\phi_{ij}$ is the SHAP contribution of feature $j$ for observation $i$.
+
+- Positive SHAP value: pushes the prediction above the baseline.
+- Negative SHAP value: pushes the prediction below the baseline.
+- Large absolute SHAP value: strong contribution for that observation.
+
+Global SHAP importance is usually calculated as the mean absolute SHAP value:
+
+$$
+I_j=\frac{1}{n}\sum_{i=1}^{n}|\phi_{ij}|
+$$
+
+For this regression model, the values are measured in the target's units: **rings**.
+
+### What question does it answer?
+
+> How much does each feature contribute to individual predictions, relative to the model's baseline output?
+
+We use a reproducible subset of the test data to keep the classroom calculation fast.
+
+```{r cell-17}
+N_SHAP <- min(300L, nrow(X_test))
+set.seed(SEED)
+shap_index <- sample.int(nrow(X_test), N_SHAP)
+X_shap <- X_test[shap_index, , drop = FALSE]
+
+# TreeSHAP uses the training predictors as its reference dataset.
+unified_forest <- treeshap::ranger.unify(forest, X_train)
+shap_result <- treeshap::treeshap(unified_forest, X_shap, interactions = FALSE,
+                                 verbose = FALSE)
+shap_values <- as.matrix(shap_result$shaps)
+stopifnot(identical(colnames(shap_values), names(X_shap)))
+
+# Recover the shared reference and verify additivity on every explained row.
+shap_predictions <- predict_forest(forest, X_shap)
+reference_values <- shap_predictions - rowSums(shap_values)
+baseline <- mean(reference_values)
+additivity_error <- max(abs(baseline + rowSums(shap_values) - shap_predictions))
+stopifnot(additivity_error < 1e-5)
+sv <- shapviz::shapviz(shap_values, X = X_shap, baseline = baseline)
+cat("SHAP matrix:", dim(shap_values), "\nReference:", baseline,
+    "rings\nMaximum additivity error:", additivity_error, "\n")
+```
+
+### Global SHAP bar plot
+
+The bar length is the mean absolute SHAP value. It describes average contribution magnitude but not direction.
+
+```{r cell-19}
+shapviz::sv_importance(sv, kind = "bar", max_display = length(feature_names)) +
+  ggtitle("Global SHAP importance: mean absolute contribution")
+```
+
+### SHAP beeswarm plot
+
+Each point is one observation:
+
+- horizontal position = SHAP contribution;
+- color = observed feature value;
+- vertical order = mean absolute SHAP importance.
+
+Unlike MDI and permutation importance, the beeswarm can show both the magnitude and direction of contributions.
+
+```{r cell-21}
+set.seed(SEED)
+shapviz::sv_importance(sv, kind = "bee", max_display = length(feature_names)) +
+  ggtitle("SHAP contributions across test observations")
+```
+
+### Question 2
+
+1. Which high feature values generally push predicted rings upward?
+2. Are any relationships non-monotonic? In other words, do both high and low feature values have mixed effects?
+
+## Compare all three global rankings
+
+The raw importance values are not directly comparable because they use different units:
+
+- MDI is a normalized fraction of accumulated impurity reduction;
+- permutation importance is an increase in RMSE;
+- SHAP importance is a mean absolute contribution measured in rings.
+
+For visualization only, we convert each column to a proportion of its own total. This compares relative emphasis, not absolute magnitude.
+
+```{r cell-24}
+shap_importance <- shap_table(shap_values)
+importance_comparison <- mdi_importance %>%
+  inner_join(permutation_df, by = "feature") %>%
+  inner_join(shap_importance, by = "feature") %>% rank_importance()
+for (column in c("mdi", "permutation_mean", "shap_mean_abs")) {
+  nonnegative <- pmax(importance_comparison[[column]], 0)
+  denominator <- sum(nonnegative)
+  importance_comparison[[paste0(column, "_share")]] <-
+    if (denominator > 0) nonnegative / denominator else rep(0, length(nonnegative))
+}
+show_table(importance_comparison %>%
+  select(feature, mdi, permutation_mean, shap_mean_abs,
+         mdi_rank, permutation_rank, shap_rank) %>% arrange(shap_rank))
+```
+
+```{r cell-25, fig.width=12, fig.height=5}
+comparison_long <- importance_comparison %>%
+  pivot_longer(c(mdi_share, permutation_mean_share, shap_mean_abs_share),
+               names_to = "method", values_to = "relative_importance") %>%
+  mutate(method = recode(method, mdi_share = "Impurity (MDI)",
+    permutation_mean_share = "Permutation", shap_mean_abs_share = "Mean |SHAP|"))
+feature_order <- importance_comparison %>% arrange(desc(shap_mean_abs)) %>% pull(feature)
+comparison_long$feature <- factor(comparison_long$feature, levels = feature_order)
+ggplot(comparison_long, aes(feature, relative_importance, fill = method)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Impurity (MDI)" = "steelblue",
+    "Permutation" = "darkorange", "Mean |SHAP|" = "#6B4C9A")) +
+  labs(x = NULL, y = "Share of importance within method", fill = NULL,
+       title = "Relative feature importance across three methods",
+       subtitle = "For display only: negative permutation values are clipped to zero") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r cell-26}
+rank_columns <- c("mdi_rank", "permutation_rank", "shap_rank")
+rank_agreement <- cor(as.matrix(importance_comparison[, rank_columns]), method = "spearman")
+method_names <- c("Impurity (MDI)", "Permutation", "Mean |SHAP|")
+dimnames(rank_agreement) <- list(method_names, method_names)
+show_table(rank_agreement, digits = 3)
+correlation_plot(rank_agreement, "Agreement Among Feature-Importance Rankings")
+```
+
+## Local SHAP explanation
+
+Global importance averages over observations. SHAP can also explain one prediction. We select the test observation with the largest absolute prediction error among the observations included in the SHAP calculation.
+
+```{r cell-28}
+shap_observed <- y_test[shap_index]
+absolute_errors <- abs(shap_observed - shap_predictions)
+local_position <- which.max(absolute_errors)
+show_table(tibble(test_row = shap_index[local_position],
+                 original_data_row = test_index[shap_index[local_position]],
+                 observed = shap_observed[local_position],
+                 predicted = shap_predictions[local_position],
+                 absolute_error = absolute_errors[local_position]))
+shapviz::sv_waterfall(sv, row_id = local_position, max_display = length(feature_names)) +
+  ggtitle("Local explanation for a large-error test observation")
+```
+
+## Visualize a learned feature relationship
+
+The SHAP scatter plot shows how a feature's observed value relates to its contribution. We automatically select the feature with the largest mean absolute SHAP value. Vertical variation at the same feature value can indicate interactions or dependence on other predictors.
+
+```{r cell-30}
+top_shap_feature <- shap_importance$feature[which.max(shap_importance$shap_mean_abs)]
+cat("Top SHAP feature:", top_shap_feature, "\n")
+shapviz::sv_dependence(sv, v = top_shap_feature, color_var = "auto") +
+  ggtitle(paste("SHAP relationship for", top_shap_feature))
+```
+
+## Experiment with correlated predictors
+
+```{r cell-32}
+# Remove shell_weight and examine whole_weight.
+feature_to_drop <- "shell_weight"
+feature_to_track <- "whole_weight"
+X_train_reduced <- X_train[, setdiff(names(X_train), feature_to_drop), drop = FALSE]
+X_test_reduced <- X_test[, setdiff(names(X_test), feature_to_drop), drop = FALSE]
+reduced_forest <- fit_forest(X_train_reduced, y_train)
+reduced_predictions <- predict_forest(reduced_forest, X_test_reduced)
+```
+
+```{r cell-33}
+reduced_mdi <- mdi_table(reduced_forest) %>% mutate(mdi_rank = min_rank(desc(mdi)))
+show_table(reduced_mdi)
+```
+
+```{r cell-34}
+reduced_permutation <- rmse_permutation(reduced_forest, X_test_reduced, y_test) %>%
+  mutate(permutation_rank = min_rank(desc(permutation_mean)))
+show_table(reduced_permutation)
+```
+
+```{r cell-35}
+# Same held-out observations as the original explanation.
+X_shap_reduced <- X_shap[, setdiff(names(X_shap), feature_to_drop), drop = FALSE]
+unified_reduced <- treeshap::ranger.unify(reduced_forest, X_train_reduced)
+reduced_shap_result <- treeshap::treeshap(unified_reduced, X_shap_reduced,
+                                        interactions = FALSE, verbose = FALSE)
+reduced_shap_values <- as.matrix(reduced_shap_result$shaps)
+reduced_shap_importance <- shap_table(reduced_shap_values) %>%
+  mutate(shap_rank = min_rank(desc(shap_mean_abs)))
+show_table(reduced_shap_importance)
+```
+
+```{r cell-36}
+reduced_importance_comparison <- reduced_mdi %>%
+  inner_join(reduced_permutation, by = "feature") %>%
+  inner_join(reduced_shap_importance, by = "feature")
+whole_weight_comparison <- bind_rows(
+  importance_comparison %>% filter(feature == feature_to_track) %>%
+    mutate(model = "All predictors"),
+  reduced_importance_comparison %>% filter(feature == feature_to_track) %>%
+    mutate(model = "Without shell_weight")
+) %>% select(model, mdi, mdi_rank, permutation_mean, permutation_rank,
+             shap_mean_abs, shap_rank)
+show_table(whole_weight_comparison)
+```
+
+```{r cell-37}
+performance_comparison <- bind_rows(
+  regression_metrics(y_test, forest_pred) %>% mutate(model = "All predictors"),
+  regression_metrics(y_test, reduced_predictions) %>% mutate(model = "Without shell_weight")
+) %>% select(model, everything())
+show_table(performance_comparison)
+```
+
+```{r cell-38, fig.width=12, fig.height=5}
+importance_plot <- whole_weight_comparison %>%
+  select(model, mdi, permutation_mean, shap_mean_abs) %>%
+  pivot_longer(-model, names_to = "method", values_to = "importance") %>%
+  mutate(model = factor(model, levels = c("All predictors", "Without shell_weight")),
+    method = factor(method, levels = c("mdi", "permutation_mean", "shap_mean_abs"),
+      labels = c("Impurity (normalized MDI)", "Permutation (RMSE increase)", "Mean |SHAP| (rings)")))
+ggplot(importance_plot, aes(model, importance, fill = model)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = sprintf("%.3f", importance)), vjust = -0.4, size = 3.4) +
+  facet_wrap(~ method, nrow = 1, scales = "free_y") +
+  scale_fill_manual(values = c("All predictors" = "steelblue",
+                               "Without shell_weight" = "darkorange"), guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.18))) +
+  labs(title = "Importance of Whole Weight Before and After Removing Shell Weight",
+       x = NULL, y = "Importance (units differ by panel)") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+## Summary: choosing an interpretation method
+
+| Method | Primary question | Data used here | Units | Local explanations? | Major caution |
+|---|---|---|---|---|---|
+| Impurity/MDI | How did the forest reduce training impurity? | Training splits | Proportion summing to 1 | No | Split opportunities and correlated predictors can bias rankings |
+| Permutation | How much does test performance depend on a predictor? | Test data | Increase in RMSE | No | Correlation and unrealistic shuffled combinations |
+| SHAP | How does each feature contribute to predictions relative to a baseline? | Test subset | Rings | Yes | Background assumptions, dependence, and computational cost |
+
+## Final Questions
+
+1. Did dropping one correlated feature substantially reduce test performance? Did it redistribute importance to another feature? What does this demonstrate about interpreting importance as an intrinsic property of a variable?
+2. What additional information does a SHAP beeswarm provide beyond a global SHAP bar plot?
+
+## Package references
+
+- [ranger](https://imbs-hl.github.io/ranger/)
+- [treeshap](https://modeloriented.github.io/treeshap/)
+- [shapviz](https://modeloriented.github.io/shapviz/)
+
+```{r session-info}
+sessionInfo()
+```
